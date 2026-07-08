@@ -1,0 +1,14 @@
+{
+  "_comment": "Optional. Merge these hooks into your Claude Code settings.json (~/.claude/settings.json or a project .claude/settings.json) to enable the completion announcer and voice-answering of AskUserQuestion prompts. `nulvoiceagent` must be on PATH.",
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "nulvoiceagent claude-done" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "nulvoiceagent ask-pending" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "AskUserQuestion", "hooks": [ { "type": "command", "command": "nulvoiceagent ask-clear" } ] }
+    ]
+  }
+}

@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+# Your machine-specific config (voice profiles, allowlist, persona, pane registry)
+# lives in ~/.config/nulvoiceagent — it is never part of this repo.

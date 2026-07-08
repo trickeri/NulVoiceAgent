@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=nulvoiceagent — chat (push to talk)
+# Requires `nulvoiceagent` on PATH (symlink bin/nulvoiceagent into ~/.local/bin).
+# On KDE Plasma, dropping this in ~/.local/share/applications/ registers the
+# Meta+` shortcut below. Duplicate this file with `command`/`route` in the Exec
+# line (and a different key) for the other two modes.
+Exec=nulvoiceagent chat
+Icon=audio-input-microphone
+NoDisplay=true
+X-KDE-Shortcuts=Meta+grave

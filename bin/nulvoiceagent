@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# nulvoiceagent launcher — runs the package with the repo on PYTHONPATH so it works
+# without installing anything. Symlink this into your PATH, e.g.:
+#   ln -sf "$PWD/bin/nulvoiceagent" ~/.local/bin/nulvoiceagent
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+exec env PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" python3 -m nulvoiceagent "$@"
