@@ -215,3 +215,7 @@ Both brains run **read-only** (codex `-s read-only`; claude with Write/Edit/Bash
 disallowed). Command mode never lets the model *run* anything — it only picks a
 *name* from your allowlist, which `nulvoiceagent` maps to the command. The model
 can't invent or inject a command.
+
+## License
+
+[MIT](./LICENSE) © trickeri
