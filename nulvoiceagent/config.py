@@ -124,6 +124,19 @@ PITCH = os.environ.get("NULVOICEAGENT_PITCH", _PROFILE.get("PITCH", "")).strip()
 # default sink if the named sink isn't present.
 TTS_SINK = os.environ.get("NULVOICEAGENT_TTS_SINK", _PROFILE.get("TTS_SINK", "")).strip()
 
+# Optional harmony LAYER: mix in a second copy of the voice pitched LAYER_PITCH
+# semitones (e.g. -7 = a perfect fifth below) at LAYER_GAIN, adding weight under
+# the lead. Needs `rubberband` (pitch) + `ffmpeg` (EQ + mix); degrades to an
+# unfiltered python mix without ffmpeg, and to no layer without rubberband. Blank
+# LAYER_PITCH (default) = no layer. Requires a profile that opts in (LAYER_PITCH=…).
+LAYER_PITCH = os.environ.get("NULVOICEAGENT_LAYER_PITCH", _PROFILE.get("LAYER_PITCH", "")).strip()
+LAYER_GAIN = os.environ.get("NULVOICEAGENT_LAYER_GAIN", _PROFILE.get("LAYER_GAIN", "0.7")).strip()
+# Complementary EQ split between the two layers (Hz; blank = no filter):
+#   LAYER_LEAD_HPF — highpass the main (lead) so the low copy owns the lows
+#   LAYER_DOWN_LPF — lowpass the pitched-down copy so the lead owns the highs
+LAYER_LEAD_HPF = os.environ.get("NULVOICEAGENT_LAYER_LEAD_HPF", _PROFILE.get("LAYER_LEAD_HPF", "400")).strip()
+LAYER_DOWN_LPF = os.environ.get("NULVOICEAGENT_LAYER_DOWN_LPF", _PROFILE.get("LAYER_DOWN_LPF", "4000")).strip()
+
 # --- "agent is done" announcer (Claude/Codex Stop hooks) ---------------------
 # Speak a short confirmation when a Claude Code or Codex turn finishes, then
 # listen briefly for "summarize" and, if heard, speak a 2-3 sentence summary of
