@@ -83,13 +83,6 @@ GATE_MAX_SECS = float(os.environ.get("NULVOICEAGENT_GATE_MAX_SECS", "15.0"))
 # so a forgotten session can't record forever.
 MANUAL_MAX_SECS = float(os.environ.get("NULVOICEAGENT_MANUAL_MAX_SECS", "120.0"))
 
-# Optional start/stop cue sounds, played to the default sink when a manual
-# recording begins/ends. Empty (default) = silent. Point these at any short wav/
-# mp3 you like.
-CUES = os.environ.get("NULVOICEAGENT_CUES", "1").strip() not in ("0", "false", "")
-CUE_START = os.environ.get("NULVOICEAGENT_SOUND_START", "").strip()
-CUE_STOP = os.environ.get("NULVOICEAGENT_SOUND_STOP", "").strip()
-
 # --- voice / profile ---------------------------------------------------------
 # The spoken voice + delivery come from the ACTIVE profile at
 # ~/.config/nulvoiceagent/profiles/<active>.conf — a simple KEY=value file. Keep
@@ -112,6 +105,14 @@ def _active_profile() -> dict:
 
 
 _PROFILE = _active_profile()
+
+# Optional start/stop cue sounds, played to the default sink when a manual
+# recording begins/ends. Empty (default) = silent. Set SOUND_START / SOUND_STOP in
+# the active profile (or NULVOICEAGENT_SOUND_START / _STOP) to any short wav/mp3.
+CUES = os.environ.get("NULVOICEAGENT_CUES", _PROFILE.get("CUES", "1")).strip() not in ("0", "false", "")
+CUE_START = os.environ.get("NULVOICEAGENT_SOUND_START", _PROFILE.get("SOUND_START", "")).strip()
+CUE_STOP = os.environ.get("NULVOICEAGENT_SOUND_STOP", _PROFILE.get("SOUND_STOP", "")).strip()
+
 # A stock Kokoro voice by default (see the kokoromodel voice list). Override per
 # profile (VOICE=...) or with NULVOICEAGENT_VOICE.
 VOICE = os.environ.get("NULVOICEAGENT_VOICE", _PROFILE.get("VOICE", "af_heart")).strip()

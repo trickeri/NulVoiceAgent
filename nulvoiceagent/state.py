@@ -22,9 +22,53 @@ from . import config
 
 STATE_FILE = config.CACHE_DIR / "state.json"
 
+# Pidfiles that mark an in-progress INTERACTIVE turn (must match __main__.py):
+# recording.pid = a live manual recording; turn.pgid = a turn that's now
+# thinking/speaking. A turn writes these for its own process; a background
+# announcement (a separate hook-spawned process that also speaks) writes neither.
+_REC_PID = config.CACHE_DIR / "recording.pid"
+_TURN_PGID = config.CACHE_DIR / "turn.pgid"
+
+
+def _proc_is_ours(pid: int) -> bool:
+    """True if `pid` is alive AND is one of our processes (nulvoiceagent) — same
+    reuse guard as __main__._is_nulvoiceagent, so a stale/recycled pid doesn't
+    count as a live turn."""
+    try:
+        return b"nulvoiceagent" in open(f"/proc/{pid}/cmdline", "rb").read()
+    except OSError:
+        return False
+
+
+def _foreign_turn_active() -> bool:
+    """True when an interactive turn (recording, or thinking/speaking) is owned by
+    a DIFFERENT live process than us. In that case WE are a background announcement
+    and must not clobber the taskbar indicator the user's live turn owns — otherwise
+    every task-done announcement's talking->idle stomps the recording animation
+    (flicker) and eats the post-recording 'processing' state. The turn's own process
+    is never foreign to itself, so it keeps writing its listening/thinking/talking."""
+    my_pid, my_pgrp = os.getpid(), os.getpgrp()
+    try:                                    # a manual recording in progress?
+        rp = int(_REC_PID.read_text())
+        if rp != my_pid and _proc_is_ours(rp):
+            return True
+    except (OSError, ValueError):
+        pass
+    try:                                    # a turn thinking/speaking?
+        tp = int(_TURN_PGID.read_text())
+        if tp != my_pgrp and _proc_is_ours(tp):
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
 
 def write(state: str, until: float | None = None, mouth: float | None = None,
           level: float | None = None) -> None:
+    # Defer to a live interactive turn: a background announcement never overwrites
+    # the indicator while the user is recording / their turn is being processed.
+    if _foreign_turn_active():
+        return
     obj: dict = {"state": state, "ts": time.time()}
     if until is not None:
         obj["until"] = until
