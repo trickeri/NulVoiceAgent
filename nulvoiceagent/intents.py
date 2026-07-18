@@ -45,8 +45,76 @@ Parser = Callable[[str], Optional[Intent]]
 #                   ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{pct/100:.2f}"])
 
 
-# Registered parsers, tried in order. Ships empty — add your own above.
+# --- OBS clip: "clip that" -> save the replay buffer + speak confirmation ----- #
+# The MONEY intent: a missed "clip" = a lost highlight. Kept deterministic (no
+# LLM) so it's instant and never gets talked-about-instead-of-done by the chat
+# brain (which otherwise hallucinates "the player isn't running"). Grammar is
+# forgiving of ASR jitter: the utterance must START with a clip trigger, and
+# after it only throwaway filler may remain — so "clip that's the same" and
+# "clip that real quick dude" fire, but "clip the audio in Kdenlive" (real
+# content words left over) falls through to chat.
+def _clip_norm(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9 ]", " ", (text or "").lower()).split())
+
+
+_RE_CLIP_HEAD = re.compile(
+    r"^(?:hey\s+)?(?:"
+    r"clip"
+    r"|(?:make|mark|take|save|grab|drop|log)\s+(?:a\s+|the\s+|that\s+|this\s+)?clip"
+    r")\b",
+    re.IGNORECASE)
+# After the trigger, ONLY these throwaway words may remain. Any other word
+# ("audio", "kdenlive", "in", "from") means it's chat, not a clip command.
+_CLIP_FILLER = {
+    "that", "thats", "this", "it", "here", "now", "the", "a", "s",
+    "stream", "moment", "clip", "same", "one", "of", "up", "there", "right",
+    "real", "quick", "fast", "quickly", "please", "too", "though",
+    "dude", "man", "bro", "buddy", "okay", "ok",
+}
+# Splits an inline title off the command: "clip that TITLE the galaxy shader bug"
+# / "clip that CALL IT ...", "... TITLED ...", "... NAME IT ...". Everything after
+# the keyword (from the ORIGINAL text, so casing/spacing is preserved) becomes the
+# per-clip title; the part before must still be a bare clip command.
+_RE_CLIP_TITLE = re.compile(
+    r"\b(?:title[ds]?|call(?:ed)?(?:\s+it|\s+this|\s+that)?|name[ds]?(?:\s+it|\s+this|\s+that)?)\b",
+    re.IGNORECASE)
+
+
+def try_clip(text: str) -> Optional[Intent]:
+    raw = (text or "").strip()
+    # Peel off an optional inline title before checking the clip grammar.
+    title = ""
+    body = raw
+    tm = _RE_CLIP_TITLE.search(raw)
+    if tm:
+        body = raw[:tm.start()]
+        title = raw[tm.end():].strip(" \t,.;:!?-\"'").strip()
+    norm = _clip_norm(body)
+    m = _RE_CLIP_HEAD.match(norm)
+    if not m:
+        return None
+    # Everything after the trigger (minus the title) must be pure filler, else chat.
+    if any(w not in _CLIP_FILLER for w in norm[m.end():].split()):
+        return None
+    # Unlike the other (pure) parsers, this one EXECUTES the marker tool inline so
+    # the spoken confirmation carries the LIVE timecode + saved-clip note. Fast
+    # local obs-websocket call; timeout covers the replay-save poll (~3.2s).
+    argv = ["obs-clip-marker"]
+    if title:
+        argv += ["--title", title]
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True,
+                             timeout=9).stdout.strip()
+    except Exception:  # noqa: BLE001 — never crash the mic flow over the marker tool
+        out = ""
+    # Already executed above; empty argv tells run() there's nothing left to do,
+    # and __main__ still speaks intent.say (the marker's confirmation line).
+    return Intent(out or "I couldn't mark the clip.", [])
+
+
+# Registered parsers, tried in order.
 _PARSERS: list[Parser] = [
+    try_clip,
     # _volume,
 ]
 
