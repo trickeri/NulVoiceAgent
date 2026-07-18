@@ -3,3 +3,9 @@ __pycache__/
 
 # Your machine-specific config (voice profiles, allowlist, persona, pane registry)
 # lives in ~/.config/nulvoiceagent — it is never part of this repo.
+
+# Agent / tooling artifacts (local, never part of the repo)
+.claude/
+.codex/
+.graphifyignore
+graphify-out/

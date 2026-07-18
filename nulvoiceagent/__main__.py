@@ -13,6 +13,7 @@ Mic-free testing / scripting:
   nulvoiceagent panes-reset     clear ALL pane names (registry + every pane title)
   nulvoiceagent panes-prune     drop dead panes from the registry (tmux pane-close hook)
   nulvoiceagent say  "<text>"   just speak text (TTS check)
+  nulvoiceagent viewer-say --user <name> --source bits|points [--bits N] "<text>"  paying viewer's chat message, read aloud (nul-chat-hub)
   nulvoiceagent claude-done     Claude Code Stop hook: announce done + offer summary (reads hook JSON on stdin)
   nulvoiceagent codex-done      Codex Stop hook: announce done + offer summary (reads hook JSON on stdin)
   nulvoiceagent done-mute [x]   mute/unmute the "agent is done" voice; x = toggle(default)|on|off|status
@@ -27,7 +28,7 @@ import signal
 import sys
 import time
 
-from . import actions, askanswer, brain, config, dispatch, done, intents, state, stt, tts
+from . import actions, askanswer, brain, config, dispatch, done, intents, state, stt, tts, viewertts
 
 _LOG = config.CACHE_DIR / "nulvoiceagent.log"
 # PID of an in-progress manual (toggle) recording. Any hotkey press while this is
@@ -390,6 +391,29 @@ def main(argv: list[str]) -> int:
             print(f"pruned: {', '.join(dropped)}")
     elif cmd == "say":
         tts.speak(text)
+    elif cmd == "viewer-say":
+        # A paying viewer's chat message, read aloud (bits cheer / channel-point
+        # redeem). Spawned by the nul-chat-hub daemon, one per event:
+        #   viewer-say --user <name> --source bits|points [--bits N] "<raw text>"
+        user, source, bits = "someone", "bits", None
+        words = list(rest)
+        parsed: list[str] = []
+        i = 0
+        while i < len(words):
+            w = words[i]
+            if w == "--user" and i + 1 < len(words):
+                user = words[i + 1]; i += 2
+            elif w == "--source" and i + 1 < len(words):
+                source = words[i + 1]; i += 2
+            elif w == "--bits" and i + 1 < len(words):
+                try:
+                    bits = int(words[i + 1])
+                except ValueError:
+                    bits = None
+                i += 2
+            else:
+                parsed.append(w); i += 1
+        viewertts.say(user, " ".join(parsed), source=source, bits=bits)
     elif cmd == "claude-done":
         # Driven by a Claude Code Stop hook: reads the hook JSON on stdin, then
         # forks a detached child that speaks the completion + offers a summary.

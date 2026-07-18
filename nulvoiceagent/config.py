@@ -204,6 +204,37 @@ def ask_pending_path(pane: str) -> Path:
     return ASK_PENDING_DIR / f"{safe}.json"
 
 
+# --- viewer-paid TTS (bits / channel points -> spoken aloud) -----------------
+# A paying viewer's chat message, read aloud through the Miku voice. Requests are
+# spawned per-event by the nul-chat-hub daemon (`voiceagent viewer-say ...`), one
+# at a time (flock), after moderation filtering. This is a SEPARATE path from the
+# chat brain: the text is spoken verbatim, never sent to the agent's memory.
+VIEWER_TTS_ENABLE = os.environ.get("NULVOICEAGENT_VIEWER_TTS", "1").strip() not in ("0", "false", "")
+# Runtime kill switch (a FILE flag, like DONE_MUTE_FLAG): present = viewer TTS is
+# off, so it can be silenced mid-stream without restarting anything. Each request
+# is a fresh process that checks this at speak time. Absent (default) = enabled.
+VIEWER_TTS_OFF_FLAG = CACHE_DIR / "viewer-tts-off"
+# Hard cap on spoken characters (post-filter, pre-attribution). Twitch cheer/redeem
+# messages can be long; keep the read short.
+VIEWER_TTS_MAX_CHARS = int(os.environ.get("NULVOICEAGENT_VIEWER_TTS_MAX_CHARS", "200"))
+# Blocklist: one word/phrase per line (`#` comments). A case-insensitive substring
+# match on ANY line drops the whole message (we never half-speak a censored line).
+VIEWER_TTS_BLOCKLIST = Path(os.environ.get(
+    "NULVOICEAGENT_VIEWER_TTS_BLOCKLIST", str(CONFIG_DIR / "tts-blocklist.txt")))
+# Serialize concurrent requests: each viewer-say holds this flock across synth +
+# playback, so simultaneous cheers queue instead of overlapping.
+VIEWER_TTS_LOCK = CACHE_DIR / "viewer-tts.lock"
+# Yield to an in-progress Trickery turn (his chat/command recording or reply) for
+# up to this long before speaking anyway, so viewer TTS doesn't talk over him.
+VIEWER_TTS_WAIT_TURN_SECS = float(os.environ.get("NULVOICEAGENT_VIEWER_TTS_WAIT_TURN_SECS", "30"))
+# Optional distinct voice/pitch/speed for viewers so they don't sound like they ARE
+# the agent. Blank = use the active MikuVoice profile (same as chat). A small pitch
+# shift is a cheap way to set viewers apart while keeping the autotune chain.
+VIEWER_TTS_VOICE = os.environ.get("NULVOICEAGENT_VIEWER_TTS_VOICE", "").strip()
+VIEWER_TTS_PITCH = os.environ.get("NULVOICEAGENT_VIEWER_TTS_PITCH", "").strip()
+VIEWER_TTS_SPEED = os.environ.get("NULVOICEAGENT_VIEWER_TTS_SPEED", "").strip()
+
+
 # --- route mode --------------------------------------------------------------
 # "tell <named pane> to <payload>": a long-form manual recording (like chat, no
 # silence cutoff), so it shares the manual safety cap.
