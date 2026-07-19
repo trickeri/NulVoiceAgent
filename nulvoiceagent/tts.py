@@ -3,20 +3,27 @@ from __future__ import annotations
 import array
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 import wave
 
-from . import config, state
+from . import config, state, visemes
 
 # Seconds the last speak() spent on synth (kokoromodel POST + optional harmony
 # layer), i.e. the latency before any sound — NOT the playback duration. The CLI
 # reads this to log a per-turn `timing:` line. Reset on every speak().
 last_synth_secs = 0.0
+
+# Per-phoneme alignment from the last synth (torch backend only): list of
+# {ph,start,end}. Empty when the backend returns no alignment (onnx). Read by speak()
+# to build a viseme track for lip-sync.
+_last_align: list[dict] = []
 
 
 def synth(text: str, voice: str | None = None, pitch: str | None = None,
@@ -37,8 +44,17 @@ def synth(text: str, voice: str | None = None, pitch: str | None = None,
         config.KOKORO_URL, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
+    global _last_align
+    _last_align = []
     with urllib.request.urlopen(req, timeout=60) as resp:
         wav = resp.read()
+        hdr = resp.headers.get("X-Kokoro-Align")   # per-phoneme timing (torch backend)
+    if hdr:
+        try:
+            import base64
+            _last_align = json.loads(base64.b64decode(hdr))
+        except (ValueError, TypeError):
+            _last_align = []
     if config.LAYER_PITCH:
         try:
             wav = _layer(wav, float(config.LAYER_PITCH), float(config.LAYER_GAIN or "0.7"))
@@ -132,6 +148,64 @@ def play(wav: bytes) -> None:
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _mouth_envelope(wav: bytes, hop: float = 0.025) -> tuple[list[float], float]:
+    """Per-window mouth-openness 0..1 from a WAV's short-time loudness, so a reader
+    can drive real amplitude lip-sync (mouth tracks the syllables actually spoken).
+    Silence -> ~0, loud syllables -> ~1; normalized to the clip's own loud level and
+    lightly smoothed (quick open, softer close) so it tracks speech without chattering.
+    Returns (levels, hop_secs); empty list on parse failure so callers fall back."""
+    try:
+        with wave.open(io.BytesIO(wav), "rb") as w:
+            ch, sw, fr = w.getnchannels(), w.getsampwidth(), (w.getframerate() or 24000)
+            raw = w.readframes(w.getnframes())
+    except (wave.Error, OSError, ValueError):
+        return [], hop
+    if sw != 2:                                   # only 16-bit PCM
+        return [], hop
+    a = array.array("h"); a.frombytes(raw)
+    if ch > 1:                                     # downmix to mono
+        a = a[0::ch]
+    win = max(1, int(fr * hop))
+    lv: list[float] = []
+    for i in range(0, len(a), win):
+        seg = a[i:i + win]
+        if not seg:
+            break
+        rms = (sum(v * v for v in seg) / len(seg)) ** 0.5
+        db = -120.0 if rms < 1.0 else 20.0 * math.log10(rms / 32768.0)
+        lv.append(max(0.0, min(1.0, (db + 50.0) / 38.0)))   # -50 dBFS->0 .. -12 dBFS->1
+    if not lv:
+        return [], hop
+    srt = sorted(lv); p95 = srt[int(0.95 * (len(srt) - 1))]  # normalize to loud level
+    if p95 > 0.05:
+        lv = [min(1.0, x / p95) for x in lv]
+    lv = [x ** 1.3 for x in lv]                     # gamma: deepen dips -> more articulation
+    out: list[float] = []; m = 0.0                 # asymmetric smoothing
+    for x in lv:
+        m += (0.6 if x > m else 0.32) * (x - m)
+        out.append(round(m, 3))
+    return out, hop
+
+
+def _drive_mouth(env: list[float], hop: float, dur: float, until: float,
+                 stop: threading.Event, track=None) -> None:
+    """Publish the mouth envelope (amplitude) — and, when a viseme `track` is given,
+    the current viseme shape — into the state file in sync with playback (~33 Hz)
+    until the audio ends or `stop` is set. Runs in a thread alongside play()."""
+    if not env:
+        return
+    start = time.monotonic()
+    while not stop.is_set():
+        t = time.monotonic() - start
+        if t > dur + 0.05:
+            break
+        i = int(t / hop)
+        m = env[i] if i < len(env) else 0.0
+        vis = visemes.viseme_at(track, t) if track else None
+        state.write("talking", until=until, mouth=m, viseme=vis)
+        stop.wait(0.03)
+
+
 def speak(text: str, voice: str | None = None, pitch: str | None = None,
           speed: str | None = None) -> None:
     global last_synth_secs
@@ -142,12 +216,27 @@ def speak(text: str, voice: str | None = None, pitch: str | None = None,
     wav = synth(text, voice=voice, pitch=pitch, speed=speed)
     last_synth_secs = time.monotonic() - _s
     # Publish "talking" state (with the audio duration as a backstop) so an optional
-    # avatar/status reader can animate while we speak, then drop back to idle.
-    # play() blocks until the audio finishes, so this brackets the whole reply.
-    state.talking(state.wav_duration(wav))
+    # avatar/status reader can animate while we speak, then drop back to idle. play()
+    # blocks until the audio finishes, so this brackets the whole reply. A background
+    # thread streams the real syllable amplitude as `mouth` 0..1 for live lip-sync.
+    dur = state.wav_duration(wav)
+    until = time.time() + max(0.0, dur) + 0.5
+    env, hop = _mouth_envelope(wav)
+    track = visemes.build_track(_last_align) if _last_align else None
+    state.write("talking", until=until, mouth=(env[0] if env else None),
+                viseme=(visemes.viseme_at(track, 0.0) if track else None))
+    stop = threading.Event()
+    driver = None
+    if env:
+        driver = threading.Thread(target=_drive_mouth,
+                                  args=(env, hop, dur, until, stop, track), daemon=True)
+        driver.start()
     try:
         play(wav)
     finally:
+        stop.set()
+        if driver is not None:
+            driver.join(timeout=0.3)
         state.idle()
 
 
