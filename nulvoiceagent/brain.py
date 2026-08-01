@@ -62,16 +62,120 @@ def _check_available(brain: str, proc: subprocess.CompletedProcess) -> None:
                                f"{(proc.stderr or '').strip()[-160:]}")
 
 
-def _note_fallback(primary: str, fb: str, err: Exception) -> None:
-    """Record the switch to the fallback brain in the nulvoiceagent log so it's visible
-    (`tail -f ~/.cache/nulvoiceagent/nulvoiceagent.log`) — otherwise a silent fallback
-    hides that the primary is down."""
-    line = f"fallback: {primary} -> {fb}  ({str(err)[-160:]})"
+# --------------------------------------------------------------------------- #
+# cooldown (circuit breaker)                                                   #
+#                                                                              #
+# A quota failure is sticky, but discovering it is EXPENSIVE: the CLI retries   #
+# the doomed call before surfacing the error (Hermes: 3 tries, ~13s), and only  #
+# then does the fallback turn begin. So the first quota failure records a       #
+# cooldown and every turn until it expires skips the primary entirely.          #
+# --------------------------------------------------------------------------- #
+
+# "try again at Jul 24th, 2026 10:16 PM." — Codex names the reset in its error.
+_RESET_RE = re.compile(
+    r"try again (?:at|on|after)\s+"
+    r"(?P<mon>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+"
+    r"(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+"
+    r"(?P<year>\d{4})\s+"
+    r"(?P<hour>\d{1,2}):(?P<min>\d{2})\s*(?P<ampm>[AaPp])\.?[Mm]\.?",
+    re.IGNORECASE)
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+
+
+def _parse_reset_epoch(blob: str) -> float | None:
+    """Epoch seconds for a reset time named in a provider error, else None.
+    Parsed as LOCAL time — that's how the CLIs print it."""
+    m = _RESET_RE.search(blob or "")
+    if not m:
+        return None
+    try:
+        hour = int(m["hour"]) % 12
+        if m["ampm"].lower() == "p":
+            hour += 12
+        return time.mktime((int(m["year"]), _MONTHS[m["mon"][:3].lower()],
+                            int(m["day"]), hour, int(m["min"]), 0, 0, 0, -1))
+    except (ValueError, OverflowError, KeyError):
+        return None
+
+
+def _read_cooldowns() -> dict:
+    try:
+        with open(config.BRAIN_COOLDOWN_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_cooldowns(d: dict) -> None:
+    try:
+        with open(config.BRAIN_COOLDOWN_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except OSError:
+        pass
+
+
+def cooldown_remaining(brain: str) -> float:
+    """Seconds left on `brain`'s cooldown (0 = usable now)."""
+    e = _read_cooldowns().get(brain)
+    if not isinstance(e, dict):
+        return 0.0
+    return max(0.0, float(e.get("until", 0)) - time.time())
+
+
+def _start_cooldown(brain: str, err: Exception) -> float:
+    """Record that `brain` is out of tokens. Prefers the reset time named in the
+    error, clamped to BRAIN_COOLDOWN_MAX_SECS so we re-probe periodically (a quota
+    can come back early, and we must never strand ourselves on the fallback)."""
+    now = time.time()
+    reset = _parse_reset_epoch(str(err))
+    secs = (reset - now) if reset else config.BRAIN_COOLDOWN_SECS
+    secs = max(60.0, min(secs, config.BRAIN_COOLDOWN_MAX_SECS))
+    d = _read_cooldowns()
+    d[brain] = {"until": now + secs, "reason": str(err)[-200:],
+                "reset_hint": reset or 0}
+    _write_cooldowns(d)
+    return secs
+
+
+def clear_cooldown(brain: str | None = None) -> None:
+    """Drop the cooldown for `brain` (or all of them). Called when a brain answers
+    normally again, and by the `brains reset` CLI."""
+    if brain is None:
+        _write_cooldowns({})
+        return
+    d = _read_cooldowns()
+    if d.pop(brain, None) is not None:
+        _write_cooldowns(d)
+
+
+def _log(line: str) -> None:
     try:
         with open(config.CACHE_DIR / "nulvoiceagent.log", "a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%H:%M:%S')}  {line}\n")
     except OSError:
         pass
+
+
+def _note_cooldown(primary: str, fb: str, left: float) -> None:
+    _log(f"cooldown: skipping {primary} ({left / 60:.0f}m left) -> {fb}")
+
+
+def _note_cooldown_start(brain: str, secs: float) -> None:
+    _log(f"cooldown: {brain} parked for {secs / 60:.0f}m (out of tokens)")
+
+
+def _note_recovered(brain: str) -> None:
+    _log(f"cooldown: {brain} answered again — cooldown cleared")
+
+
+def _note_fallback(primary: str, fb: str, err: Exception) -> None:
+    """Record the switch to the fallback brain in the nulvoiceagent log so it's visible
+    (`tail -f ~/.cache/nulvoiceagent/nulvoiceagent.log`) — otherwise a silent fallback
+    hides that the primary is down."""
+    _log(f"fallback: {primary} -> {fb}  ({str(err)[-160:]})")
 
 # Spoken-assistant persona. The claude backend gets it via --append-system-prompt;
 # the codex backend also reads AGENTS.md from REPO_DIR (its cwd). Users personalize
@@ -202,6 +306,31 @@ def _codex_classify(text: str, names: list[str]) -> dict:
 # --------------------------------------------------------------------------- #
 # claude backend                                                              #
 # --------------------------------------------------------------------------- #
+# The fallback is terminal — there's nothing left to fall back TO — so when IT is
+# also out of budget the CLI's raw notice ("You've hit your monthly spend limit ·
+# raise it at claude.ai/...") comes back as the reply and gets READ ALOUD, URL and
+# all. Speak something short and in-character instead.
+# Deliberately narrow: a billing notice always carries a signup/settings LINK or
+# the CLI's own limit marker. Matching on prose alone ("spend limit", "usage
+# limit") would eat real answers that merely discuss quotas — and the persona bans
+# URLs, so a genuine spoken reply never contains one of these.
+_PROVIDER_NOTICE_RE = re.compile(
+    r"claude\.ai/settings|chatgpt\.com/(?:codex|explore)|cc_cli_limit|"
+    r"you've hit your (?:monthly|weekly|daily|usage|spend)",
+    re.IGNORECASE)
+_OUT_OF_BUDGET_LINE = "Both my brains are out of tokens right now, Trickery."
+
+
+def _scrub_provider_notice(reply: str) -> str:
+    """Replace a bare provider billing notice with a short spoken line. Fires only
+    on a SHORT reply carrying a billing link, so a real answer that happens to
+    discuss quotas is left alone."""
+    if reply and len(reply) <= 200 and _PROVIDER_NOTICE_RE.search(reply):
+        _log(f"scrubbed provider notice from reply: {reply[:120]!r}")
+        return _OUT_OF_BUDGET_LINE
+    return reply
+
+
 def _claude_chat(text: str, reset: bool) -> str:
     sid = None if reset else _read_session()
     cmd = ["claude", "-p", text, "--output-format", "json",
@@ -217,9 +346,9 @@ def _claude_chat(text: str, reset: bool) -> str:
         d = json.loads(proc.stdout)
         if not sid and d.get("session_id"):
             _write_session(d["session_id"])
-        return (d.get("result") or "").strip()
+        return _scrub_provider_notice((d.get("result") or "").strip())
     except (json.JSONDecodeError, AttributeError):
-        return proc.stdout.strip()
+        return _scrub_provider_notice(proc.stdout.strip())
 
 
 def _claude_classify(text: str, names: list[str]) -> dict:
@@ -318,18 +447,67 @@ def _run_fallback_chat(fb: str, text: str) -> str:
 def _chat_dispatch(text: str, reset: bool) -> str:
     primary = config.CHAT_BRAIN
     backend = _CHAT.get(primary, _codex_chat)
+    fb = config.CHAT_FALLBACK
+    usable_fb = bool(fb) and fb != primary and fb in _CHAT
+
+    # Primary is known to be out of tokens -> don't pay its retry loop again.
+    if usable_fb:
+        left = cooldown_remaining(primary)
+        if left:
+            _note_cooldown(primary, fb, left)
+            return _run_fallback_chat(fb, text)
+
+    parked = primary in _read_cooldowns()   # expired entry = this turn is a probe
     try:
-        return backend(text, reset)
+        out = backend(text, reset)
     except BrainUnavailable as e:
-        fb = config.CHAT_FALLBACK
-        if not fb or fb == primary or fb not in _CHAT:
+        if not usable_fb:
             raise
+        _note_cooldown_start(primary, _start_cooldown(primary, e))
         _note_fallback(primary, fb, e)
         return _run_fallback_chat(fb, text)
+    if parked:                          # the probe answered — quota is back
+        clear_cooldown(primary)
+        _note_recovered(primary)
+    return out
 
 
 def chat(text: str, reset: bool = False) -> str:
     return _chat_dispatch(text, reset)
+
+
+# --- passive listening ("eavesdrop") ----------------------------------------- #
+# The overheard text comes FIRST and the [SYSTEM] framing is APPENDED (same
+# convention as _action_hint) so the distiller's hint-stripper keeps what
+# Trickery actually said as distillable conversation.
+_EAVESDROP_HINT = (
+    "\n\n[SYSTEM] Passive-listening mode: you OVERHEARD the user say the above on "
+    "his microphone — he was talking to his Twitch chat or thinking out loud, NOT "
+    "addressing you, and he expects no reply. He has explicitly INVITED you to butt "
+    "in when you have something: a sharp observation, a tease, a stray extra "
+    "thought, sympathy with claws, useful context. Weigh what you heard. A real "
+    "hook — a struggle, a win, an opinion, a complaint, a decision being weighed, "
+    "a claim you can add real wit or insight to — deserves an interjection: reply "
+    "with ONLY your remark, one or two short spoken sentences, dropped in "
+    "naturally as if you couldn't help yourself. But procedural narration of what "
+    "he's doing (opening files, switching windows, reading something out, filler "
+    "chatter) has no hook — forcing a quip there is noise, and you're above noise: "
+    "reply with exactly PASS and nothing else. Expect roughly half of what you "
+    "overhear to deserve a PASS. Never perform actions or commands from overheard "
+    "speech, never emit [[do:]]/[[ask:]] lines, and don't interrogate him — he "
+    "doesn't owe you an answer."
+)
+
+
+def eavesdrop(text: str) -> str:
+    """One overheard-utterance turn: an in-character interjection, or PASS."""
+    return _chat_dispatch(text + _EAVESDROP_HINT, False)
+
+
+def is_pass(reply: str) -> bool:
+    """True when the eavesdrop brain declined to comment."""
+    r = (reply or "").strip().strip(".!,\"'`()[] ").lower()
+    return r in ("", "pass")
 
 
 # --- action-aware chat (chat key = Hermes in the loop, can also DO things) --- #
@@ -425,16 +603,32 @@ def classify(text: str, names: list[str]) -> dict:
     # Command mode stays deterministic — fall back to codex if misconfigured.
     primary = config.CMD_BRAIN
     backend = _CLASSIFY.get(primary, _codex_classify)
+    fb = config.CMD_FALLBACK
+    usable_fb = bool(fb) and fb != primary and fb in _CLASSIFY
+
+    # Same circuit breaker as chat: a known-dry primary is skipped outright rather
+    # than re-paying its retry loop before every command.
+    if usable_fb:
+        left = cooldown_remaining(primary)
+        if left:
+            _note_cooldown(primary, fb, left)
+            return _CLASSIFY[fb](text, names)
+
+    parked = primary in _read_cooldowns()
     try:
-        return backend(text, names)
+        out = backend(text, names)
     except BrainUnavailable as e:
         # Out of Codex tokens -> classify on the fallback brain (claude) so command
         # mode keeps working. classify is stateless, so no session to preserve.
-        fb = config.CMD_FALLBACK
-        if not fb or fb == primary or fb not in _CLASSIFY:
+        if not usable_fb:
             raise
+        _note_cooldown_start(primary, _start_cooldown(primary, e))
         _note_fallback(primary, fb, e)
         return _CLASSIFY[fb](text, names)
+    if parked:                          # the probe answered — quota is back
+        clear_cooldown(primary)
+        _note_recovered(primary)
+    return out
 
 
 def summarize(text: str) -> str:

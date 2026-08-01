@@ -60,6 +60,46 @@ CMD_MODEL = os.environ.get("NULVOICEAGENT_CMD_MODEL", "").strip()
 CMD_REASONING = os.environ.get("NULVOICEAGENT_CMD_REASONING", "low").strip()
 CHAT_REASONING = os.environ.get("NULVOICEAGENT_CHAT_REASONING", "low").strip()
 
+# --- brain cooldown (circuit breaker) ----------------------------------------
+# When a primary brain is out of tokens it doesn't fail fast: the CLI retries the
+# doomed call several times first (Hermes does 3 with backoff -> ~13s of dead air
+# BEFORE the fallback turn even starts). Once we've seen a quota failure there's no
+# point paying that on every following turn, so we remember it and go straight to
+# the fallback until the quota is expected back.
+BRAIN_COOLDOWN_FILE = CACHE_DIR / "brain-cooldown.json"
+# Cooldown used when the provider's error names no reset time.
+BRAIN_COOLDOWN_SECS = float(os.environ.get("NULVOICEAGENT_BRAIN_COOLDOWN_SECS", "900"))
+# Hard cap on any cooldown, INCLUDING a reset time parsed out of the error. Quotas
+# often come back before the stated reset (and a stale cooldown would strand us on
+# the fallback for days), so we re-probe the primary at least this often. One probe
+# costs the ~13s retry loop, so keep it comfortably long.
+BRAIN_COOLDOWN_MAX_SECS = float(os.environ.get("NULVOICEAGENT_BRAIN_COOLDOWN_MAX_SECS", "3600"))
+
+# --- memory distiller --------------------------------------------------------
+# Hermes' own auto-memory never fires on the voice path: its "consider writing
+# memory" nudge counts user turns WITHIN a session (nudge_interval, default 10),
+# but every voice turn is a fresh `hermes -z` oneshot that starts the counter at 1
+# and exits. So we distill offline instead — a periodic pass over the recorded
+# conversation that updates Hermes' user profile.
+HERMES_DIR = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+HERMES_STATE_DB = HERMES_DIR / "state.db"           # every message, all sessions
+HERMES_USER_FILE = HERMES_DIR / "memories" / "USER.md"
+DISTILL_WATERMARK = CACHE_DIR / "distill-watermark"  # last distilled message id
+DISTILL_BACKUP_DIR = CACHE_DIR / "distill-backups"
+DISTILL_DIFF_FILE = CACHE_DIR / "distill-last.diff"  # what the last run changed
+DISTILL_MODEL = os.environ.get("NULVOICEAGENT_DISTILL_MODEL", "claude-sonnet-5").strip()
+# Don't bother running for a handful of new messages.
+DISTILL_MIN_MESSAGES = int(os.environ.get("NULVOICEAGENT_DISTILL_MIN_MESSAGES", "10"))
+# Cap what we feed the distiller (most recent wins).
+DISTILL_MAX_TRANSCRIPT_CHARS = int(
+    os.environ.get("NULVOICEAGENT_DISTILL_MAX_TRANSCRIPT_CHARS", "60000"))
+# Hard ceiling for the rewritten USER.md. MUST stay UNDER Hermes' own
+# memory.user_char_limit (raised to 5000) — that limit is enforced by its memory
+# tool's add(), which refuses any entry that would push the file past it. The gap
+# between the two is deliberate: it leaves room for Hermes to write an explicit
+# "remember this" between distiller runs without hitting the wall.
+DISTILL_BUDGET_CHARS = int(os.environ.get("NULVOICEAGENT_DISTILL_BUDGET_CHARS", "4000"))
+
 # --- mic capture -------------------------------------------------------------
 # PipeWire/PulseAudio source name (parec --device=). Empty (default) = the system
 # default input. Set NULVOICEAGENT_SOURCE to pin a specific mic (find names with
@@ -166,6 +206,53 @@ DONE_VOICE_MARK_DIR = CACHE_DIR / "voice-cmd"
 # A voice marker older than this (seconds) is treated as orphaned — its task never
 # produced a Stop — so a stale mark can't authorize a later typed task's announce.
 DONE_VOICE_MARK_TTL = float(os.environ.get("NULVOICEAGENT_DONE_VOICE_MARK_TTL", "21600"))  # 6h
+
+# --- passive listening ("eavesdrop" mode, `nulvoiceagent passive`) -----------
+# A daemon (nulvoiceagent-passive.service, toggled from the avatar's right-click
+# menu) that overhears normal mic speech — Trickery addressing Twitch chat or
+# thinking out loud, NOT push-to-talk — and occasionally interjects an
+# in-character conversational remark. Chat-only by design: it never routes to
+# intents/actions/panes, so an overheard "clip that" can't fire anything.
+# Chance an overheard utterance is even CONSIDERED (sent to the brain). The
+# brain then still declines most of what it hears (replies PASS), so the real
+# interjection rate is well below this.
+PASSIVE_PROB = float(os.environ.get("NULVOICEAGENT_PASSIVE_PROB", "0.33"))
+# Minimum seconds between brain calls (cost/annoyance cap — stamped on every
+# considered utterance, even ones the brain PASSes on).
+PASSIVE_COOLDOWN_SECS = float(os.environ.get("NULVOICEAGENT_PASSIVE_COOLDOWN_SECS", "240"))
+# Utterance filters: too-short blips aren't worth a thought; the trail is a bit
+# longer than the command gate's so mid-sentence pauses don't split a musing.
+PASSIVE_MIN_SECS = float(os.environ.get("NULVOICEAGENT_PASSIVE_MIN_SECS", "2.0"))
+PASSIVE_MAX_SECS = float(os.environ.get("NULVOICEAGENT_PASSIVE_MAX_SECS", "30.0"))
+PASSIVE_TRAIL = float(os.environ.get("NULVOICEAGENT_PASSIVE_TRAIL", "1.2"))
+PASSIVE_MIN_WORDS = int(os.environ.get("NULVOICEAGENT_PASSIVE_MIN_WORDS", "5"))
+# Seconds each capture cycle waits for speech onset before recycling parec.
+PASSIVE_ONSET_WAIT = float(os.environ.get("NULVOICEAGENT_PASSIVE_ONSET_WAIT", "30.0"))
+PASSIVE_LAST_FILE = CACHE_DIR / "passive-last"      # epoch of the last brain call
+PASSIVE_LOCK_FILE = CACHE_DIR / "passive.lock"      # single-instance flock
+# Passive listening must be BLIND to anything said on a hotkey. The push-to-talk
+# keys are covered by our own recording.pid/turn.pgid, but voicechat DICTATION
+# (Meta+CapsLock) is a separate daemon — we watch its published status file.
+# Words dictated into a window aren't musings to overhear, and an interjection
+# spoken over them is transcribed straight into the dictation.
+VOICECHAT_STATUS_FILE = Path(os.environ.get(
+    "VOICECHAT_STATUS_FILE",
+    str(Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        / "voicechat" / "status.json")))
+# voicechat states that mean a dictation turn is in flight (it also publishes
+# 'done'/'error', which are transient tail states).
+VOICECHAT_BUSY_STATES = frozenset({"listening", "processing"})
+# A 'listening' that never transitions (crashed dictation daemon) mustn't wedge
+# passive listening off forever. Generous: real dictations run minutes.
+PASSIVE_DICTATION_STALE_SECS = float(os.environ.get(
+    "NULVOICEAGENT_PASSIVE_DICTATION_STALE_SECS", "600"))
+# Extra quiet window after a hotkey turn ends, so the tail of a dictation (or of
+# her own reply) isn't picked up as overheard speech.
+PASSIVE_BUSY_GRACE_SECS = float(os.environ.get(
+    "NULVOICEAGENT_PASSIVE_BUSY_GRACE_SECS", "2.0"))
+# How often the busy watcher samples the hotkey/dictation state files.
+PASSIVE_BUSY_POLL_SECS = float(os.environ.get(
+    "NULVOICEAGENT_PASSIVE_BUSY_POLL_SECS", "0.25"))
 
 
 def voice_mark_path(pane: str) -> Path:

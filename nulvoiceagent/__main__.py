@@ -19,6 +19,8 @@ Mic-free testing / scripting:
   nulvoiceagent done-mute [x]   mute/unmute the "agent is done" voice; x = toggle(default)|on|off|status
   nulvoiceagent done-voice-only [x]  announce only VOICE-started tasks (typed tasks stay silent); x = toggle(default)|on|off|status
   nulvoiceagent newtopic        forget the chat conversation context
+  nulvoiceagent passive         passive-listening daemon loop (eavesdrop + occasional interjection; run via nulvoiceagent-passive.service)
+  nulvoiceagent passive-toggle [x]  start/stop the eavesdrop service; x = toggle(default)|on|off|status
 
 Global: --brain codex|claude overrides NULVOICEAGENT_BRAIN for this run.
 """
@@ -28,7 +30,8 @@ import signal
 import sys
 import time
 
-from . import actions, askanswer, brain, config, dispatch, done, intents, state, stt, tts, viewertts
+from . import (actions, askanswer, brain, config, dispatch, distill, done,
+               intents, passive, state, stt, tts, viewertts)
 
 _LOG = config.CACHE_DIR / "nulvoiceagent.log"
 # PID of an in-progress manual (toggle) recording. Any hotkey press while this is
@@ -485,6 +488,48 @@ def main(argv: list[str]) -> int:
         else:  # toggle
             new = done.set_voice_only(not done.is_voice_only())
         print("voice-only" if new else "all-tasks")
+    elif cmd == "distill":
+        # Offline memory distillation (see distill.py for why Hermes' own
+        # auto-memory can't fire on the voice path). Run by a systemd timer;
+        # `--dry-run` prints the proposed diff without touching the file.
+        return distill.run(dry_run="--dry-run" in rest,
+                           verbose=True)
+    elif cmd == "brains":
+        # `brains` shows which brains are parked on a quota cooldown (and for how
+        # long); `brains reset` un-parks them so the next turn probes the primary.
+        if rest and rest[0] == "reset":
+            brain.clear_cooldown()
+            print("cooldowns cleared")
+            return 0
+        for name in (config.CHAT_BRAIN, config.CMD_BRAIN):
+            left = brain.cooldown_remaining(name)
+            print(f"{name}: {'parked %.0fm' % (left / 60) if left else 'ready'}")
+    elif cmd == "passive":
+        # The passive-listening (eavesdrop) daemon loop. Meant to run under
+        # nulvoiceagent-passive.service; toggled from the avatar's right-click
+        # menu via `passive-toggle`.
+        return passive.run()
+    elif cmd == "passive-toggle":
+        # Start/stop the eavesdrop service (or report it). Called by the taskbar
+        # avatar context menu; prints the resulting state.
+        import subprocess
+        unit = "nulvoiceagent-passive.service"
+        arg = (rest[0].strip().lower() if rest else "toggle")
+        active = subprocess.run(["systemctl", "--user", "is-active", unit],
+                                capture_output=True, text=True).stdout.strip() == "active"
+        if arg in ("status", "state"):
+            new = active
+        elif arg in ("on", "start", "1", "true"):
+            subprocess.run(["systemctl", "--user", "start", unit], check=False)
+            new = True
+        elif arg in ("off", "stop", "0", "false"):
+            subprocess.run(["systemctl", "--user", "stop", unit], check=False)
+            new = False
+        else:  # toggle
+            subprocess.run(["systemctl", "--user",
+                            "stop" if active else "start", unit], check=False)
+            new = not active
+        print("listening" if new else "off")
     elif cmd == "newtopic":
         brain.reset_session()
         tts.speak("Okay, fresh start. What's on your mind?")
