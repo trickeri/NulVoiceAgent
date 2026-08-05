@@ -356,3 +356,39 @@ SESSION_END_KEYS = [k for k in os.environ.get(
 # Gap (seconds) between those keypresses so the target registers each one (Claude
 # Code needs the first Ctrl-C to land before the second confirms the exit).
 SESSION_END_KEY_DELAY = float(os.environ.get("NULVOICEAGENT_SESSION_END_KEY_DELAY", "0.3"))
+
+
+# --- narrate: read the focused page/selection aloud ------------------------- #
+# Nulium already runs with --remote-debugging-port=9222, so the browser needs no
+# change; we read the focused tab's live selection + body text over CDP.
+NARRATE_CDP_URL = os.environ.get("NULVOICEAGENT_CDP_URL", "http://127.0.0.1:9222")
+NARRATE_CDP_TIMEOUT = float(os.environ.get("NULVOICEAGENT_CDP_TIMEOUT", "6.0"))
+# Per-tab focus probe — short so one wedged tab can't stall the turn.
+NARRATE_CDP_PROBE_TIMEOUT = float(
+    os.environ.get("NULVOICEAGENT_CDP_PROBE_TIMEOUT", "1.5"))
+# A live in-page selection this long wins over the article body (the "narrate
+# what I highlighted" priority). Short enough to catch a sentence, long enough
+# that a stray double-click on one word doesn't hijack the page read.
+NARRATE_MIN_SELECTION = int(os.environ.get("NULVOICEAGENT_MIN_SELECTION", "40"))
+# Hard cap on extracted text (a runaway page shouldn't queue an hour of speech).
+NARRATE_MAX_CHARS = int(os.environ.get("NULVOICEAGENT_NARRATE_MAX_CHARS", "120000"))
+# Target size of one spoken chunk. Chunks are the pause/resume granularity and
+# the replay unit, so keep them ~a sentence or two.
+NARRATE_CHUNK_CHARS = int(os.environ.get("NULVOICEAGENT_NARRATE_CHUNK", "320"))
+NARRATE_STATE_FILE = CACHE_DIR / "narration.json"   # {state,i,n,title,pid,ts}
+NARRATE_PID_FILE = CACHE_DIR / "narration.pid"
+NARRATE_TEXT_FILE = CACHE_DIR / "narration-chunks.json"
+# Words-per-minute estimate used only to tell him how long a read will take.
+NARRATE_WPM = float(os.environ.get("NULVOICEAGENT_NARRATE_WPM", "155"))
+
+
+# --- phrase ledger: keep her from wearing out her own signature lines ------- #
+LEDGER_ENABLE = os.environ.get("NULVOICEAGENT_LEDGER", "1") not in ("0", "false", "no")
+# How many of her recent spoken replies to measure. Small enough to reflect "this
+# session", big enough that a couple of repeats are a real pattern.
+LEDGER_WINDOW = int(os.environ.get("NULVOICEAGENT_LEDGER_WINDOW", "25"))
+# A phrase/opening must recur this many times in the window to be called out.
+LEDGER_MIN_REPEAT = int(os.environ.get("NULVOICEAGENT_LEDGER_MIN_REPEAT", "2"))
+# Cap on watched images named in one hint — a long list reads as a style lecture
+# and starts crowding out the actual conversation.
+LEDGER_MAX_ITEMS = int(os.environ.get("NULVOICEAGENT_LEDGER_MAX_ITEMS", "3"))

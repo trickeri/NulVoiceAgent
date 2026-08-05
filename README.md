@@ -155,10 +155,46 @@ nulvoiceagent do  "lock the screen"     # text in → classify → allowlisted a
 | `nulvoiceagent newtopic` | forget chat context (codex/claude sessions) |
 | `nulvoiceagent claude-done` / `codex-done` | Stop-hook: announce done + offer summary |
 | `nulvoiceagent ask-pending` / `ask-clear` | Claude Code AskUserQuestion hooks |
+| `nulvoiceagent narrate "<text>"` | read the focused page aloud (mic-free test seam) |
+| `nulvoiceagent narrate-pause\|-resume\|-stop\|-status` | drive a running narration |
 | `… --brain hermes\|codex\|claude` | override the brain for one run |
 
 **Barge-in:** pressing a voice hotkey while the agent is thinking or speaking stops
 it and starts listening again in one press.
+
+## Narration — "narrate"
+
+Say **"narrate"** and it reads what's in front of you, in priority order:
+
+1. **a live in-page selection** — whatever you have highlighted right now wins;
+2. **the focused tab's article text** — a Readability-lite extraction;
+3. **outside the browser**, the primary selection / clipboard.
+
+The focused tab is found over the Chrome DevTools Protocol with
+`document.hasFocus()`, which is true only for the active tab of the focused
+window — so one probe answers both "is the browser even the app he's looking at?"
+and "which tab?", with no window-manager query. Chromium needs
+`--remote-debugging-port=9222` (already set on Nulium); nothing is installed in
+the browser.
+
+| Say | Does |
+|---|---|
+| *"narrate"* / *"narrate this page"* | reads it verbatim, instantly (no LLM call) |
+| *"narrate the highlighted text"* | only the selection |
+| *"narrate the section about B-Trees"* | slices the page by matching heading |
+| *"narrate a summary of this page"* | condenses it through the brain first |
+| *"pause"* / *"resume"* / *"stop"* | only claimed **while a narration is running** |
+
+**Why the narrator is a separate process.** Speech normally runs inside the turn,
+and barge-in kills the turn's whole process group — so pressing the key to *say*
+"pause" would kill the reading instead of pausing it. The narrator is spawned
+detached in its own session and driven by signals (`SIGUSR1` pause, `SIGUSR2`
+resume, `SIGTERM` stop). Pressing any voice hotkey auto-pauses it, so the mic
+never hears the narration and "resume" is meaningful rather than a race.
+
+Reading is chunked by sentence; a pause mid-chunk replays that chunk from its
+start on resume. Long pages are read in full — say "stop" when you've heard
+enough.
 
 ## Routing commands to named tmux panes
 
@@ -205,6 +241,10 @@ Everything is env-overridable (`NULVOICEAGENT_*`). Common ones:
 | `NULVOICEAGENT_VOICE` / `_SPEED` / `_PITCH` | profile | override the active voice profile |
 | `NULVOICEAGENT_TTS_SINK` | *(default sink)* | play into a named PipeWire sink |
 | `NULVOICEAGENT_SOURCE` | *(default input)* | pin a specific mic (`pactl list sources short`) |
+| `NULVOICEAGENT_CDP_URL` | `http://127.0.0.1:9222` | browser DevTools endpoint used by `narrate` |
+| `NULVOICEAGENT_MIN_SELECTION` | `40` | chars of highlighted text that outrank the page body |
+| `NULVOICEAGENT_NARRATE_CHUNK` | `320` | chars per spoken chunk (pause/resume granularity) |
+| `NULVOICEAGENT_NARRATE_MAX_CHARS` | `120000` | hard cap on extracted page text |
 
 See `nulvoiceagent/config.py` for the full set (mic gate, done-announcer, ask-answer,
 route timings).

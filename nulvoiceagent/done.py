@@ -439,6 +439,13 @@ def _speaker(pane: str | None = None, default: str = "Claude") -> str:
 _COMPLETION = config.CACHE_DIR / "last-completion.json"
 _COMPLETION_TTL = 300.0  # seconds — don't summarize something reported ages ago
 _SUMMARY_KW = re.compile(r"\bsummar(?:ize|ise|y)\b", re.IGNORECASE)
+# "narrate a summary of this page" is about the PAGE in front of him, not the last
+# Claude completion — the narration intent owns anything that opens with a read/
+# narrate verb. Without this guard the done-announcer claims it first (it runs
+# ahead of intents in _handle_chat) and summarizes the wrong thing entirely.
+_NARRATE_LEAD = re.compile(
+    r"^\s*(?:hey\s+|ok(?:ay)?\s+)?(?:(?:can|could|would|will)\s+you\s+)?"
+    r"(?:please\s+)?(?:n[ae]rr?ate\w*|no\s+rate|read)\b", re.IGNORECASE)
 
 
 def _stash_completion(who: str, kind: str, text: str) -> None:
@@ -467,6 +474,8 @@ def wants_summary_request(text: str) -> bool:
     even so, make_summary() only fires when there's a FRESH completion to summarize,
     otherwise the caller falls through to normal chat."""
     t = (text or "").strip()
+    if _NARRATE_LEAD.match(t):
+        return False
     return bool(_SUMMARY_KW.search(t)) and len(t.split()) <= 8
 
 

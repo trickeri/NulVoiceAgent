@@ -791,12 +791,140 @@ def try_voice_switch(text: str) -> Optional[Intent]:
     return Intent(f"Switched to the {name} voice.", [])
 
 
+# --- narration: "narrate" reads the focused page / selection aloud ---------- #
+# ASR renders "narrate" a few ways; "no rate" is the usual slip.
+_NARRATE_WORD = r"(?:n[ae]rr?ate\w*|no\s+rate)"
+_RE_NARRATE = re.compile(
+    r"^(?:hey\s+|ok(?:ay)?\s+)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
+    rf"(?:(?P<n>{_NARRATE_WORD})|(?P<r>read))\b",
+    re.IGNORECASE)
+# Bare "read" is Trickery's existing clipboard trigger, so the read-verb form only
+# claims the utterance when it names something page-like to read.
+# Deliberately does NOT accept a bare "this"/"it" — "read it" is far more likely
+# to mean the clipboard than the page, so it stays with the clipboard trigger.
+_RE_READ_TARGET = re.compile(
+    r"\b(?:page|article|post|site|screen|tab|selection|highlight\w*|"
+    r"out\s+loud|aloud)\b", re.IGNORECASE)
+_RE_NARR_SUMMARY = re.compile(
+    r"\b(?:summar\w+|sum\s+(?:it\s+)?up|gist|tl;?dr|brief\w*|condense|"
+    r"overview|recap)\b", re.IGNORECASE)
+_RE_NARR_SELECTION = re.compile(
+    r"\b(?:selection|selected|highlight\w*)\b", re.IGNORECASE)
+_RE_NARR_WHOLE = re.compile(
+    r"\b(?:whole|entire|full|all\s+of)\b", re.IGNORECASE)
+# "the section about X" / "the part on X" / "the X section"
+_RE_NARR_SECTION = re.compile(
+    r"\b(?:section|part|chapter|bit|paragraph|heading)\s+"
+    r"(?:about|on|called|titled|named|regarding|for)\s+(?P<a>.+)$",
+    re.IGNORECASE)
+_RE_NARR_SECTION_2 = re.compile(
+    r"\bthe\s+(?P<a>.+?)\s+(?:section|part|chapter|heading)\b", re.IGNORECASE)
+_RE_NARR_ABOUT = re.compile(
+    r"\b(?:about|on|regarding|covering)\s+(?P<a>.+)$", re.IGNORECASE)
+_NARR_MAX_WORDS = 18
+# Trailing politeness that isn't part of a section name.
+_RE_NARR_TAIL = re.compile(
+    r"\b(?:to|for)\s+me\b|\b(?:out\s+loud|aloud|please|now|for\s+me)\b",
+    re.IGNORECASE)
+
+
+def try_narrate(text: str) -> Optional[Intent]:
+    """"narrate" -> read the focused page (or what's highlighted) aloud.
+
+    Priority is the live in-page selection, then the article body; a named
+    section slices the page by heading; "narrate a summary of this" routes
+    through the brain instead of reading verbatim. Work happens inline (extract
+    + spawn the detached narrator) and the returned .say is EMPTY on success —
+    the narration is the reply, and a spoken ack would talk over its first chunk.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    m = _RE_NARRATE.match(raw)
+    if not m:
+        return None
+    rest = raw[m.end():].strip()
+    if m.group("r") and not _RE_READ_TARGET.search(rest):
+        return None                    # bare "read …" stays the clipboard trigger
+    # A narration command is short. Without this a long ramble that happens to
+    # open with "read this…" could hijack the turn.
+    if len(_norm(raw).split()) > _NARR_MAX_WORDS:
+        return None
+    rest = _RE_NARR_TAIL.sub(" ", rest)
+    rest = re.sub(r"^[\s,\-–—:]+|[\s,\.\-–—:!?]+$", "", rest)
+    summarize = bool(_RE_NARR_SUMMARY.search(rest))
+    prefer = "auto"
+    if _RE_NARR_SELECTION.search(rest):
+        prefer = "selection"
+    elif _RE_NARR_WHOLE.search(rest):
+        prefer = "page"
+    focus = ""
+    for pat in (_RE_NARR_SECTION, _RE_NARR_SECTION_2, _RE_NARR_ABOUT):
+        got = pat.search(rest)
+        if got:
+            focus = got.group("a").strip(" .,:;-")
+            break
+    # "narrate a summary of this page" — "this page" is the target, not a section.
+    if focus and _norm(focus) in ("this", "that", "it", "this page", "the page",
+                                 "this article", "the article", "this thing"):
+        focus = ""
+    from . import narrate                        # local: keeps import order simple
+    say = narrate.handle(prefer=prefer, focus=focus, summarize=summarize)
+    return Intent(say, [])
+
+
+_RE_NARR_PAUSE = re.compile(r"^(?:pause|hold\s+(?:on|up)|wait)\b", re.IGNORECASE)
+_RE_NARR_RESUME = re.compile(
+    r"^(?:resume|continue|unpause|carry\s+on|go\s+on|go\s+ahead|"
+    r"keep\s+(?:going|reading))\b", re.IGNORECASE)
+_RE_NARR_STOP = re.compile(
+    r"^(?:stop|cancel|quiet|shut\s+up|enough|that\s?s\s+enough|"
+    r"never\s?mind|forget\s+it)\b", re.IGNORECASE)
+_NARR_CTL_MAX_WORDS = 6
+
+
+def try_narration_control(text: str) -> Optional[Intent]:
+    """pause / resume / stop — but ONLY while a narration is running.
+
+    Gated on narrate.is_active() so these very common words can never hijack
+    normal chat when nothing is being read. Note the hotkey press itself already
+    auto-paused the narration (so the mic doesn't hear her), which is what makes
+    "resume" the meaningful half of this pair.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    from . import narrate
+    if not narrate.is_active():
+        return None
+    low = _norm(raw)
+    if not low or len(low.split()) > _NARR_CTL_MAX_WORDS:
+        return None
+    # "stop the stream" is a different machine entirely — never claim it here.
+    if re.search(r"\b(?:stream|streaming|recording|music|obs)\b", low):
+        return None
+    if _RE_NARR_PAUSE.match(low):
+        narrate.pause()
+        return Intent("Paused.", [])
+    if _RE_NARR_RESUME.match(low):
+        narrate.resume()
+        return Intent("", [])          # she just carries on reading
+    if _RE_NARR_STOP.match(low):
+        narrate.stop()
+        return Intent("Stopped.", [])
+    return None
+
+
 # Registered parsers, tried in order. Order matters: resize (needs a resize verb +
 # existing-doc words) is checked before new (needs a create verb) — they're
 # otherwise mutually exclusive. try_clip is near the front — a unique bare word.
+# Narration control leads: it is inert unless a narration is actually running,
+# and while one is, "pause"/"stop" must beat every other grammar.
 # The OBS/stream intents are cheap and specific (they only fire on a clear
 # scene/overlay/chat command).
 _PARSERS: list[Parser] = [
+    try_narration_control,
+    try_narrate,
     try_voice_switch,
     try_clip,
     try_stream_command,

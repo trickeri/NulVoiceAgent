@@ -18,6 +18,7 @@ Mic-free testing / scripting:
   nulvoiceagent codex-done      Codex Stop hook: announce done + offer summary (reads hook JSON on stdin)
   nulvoiceagent done-mute [x]   mute/unmute the "agent is done" voice; x = toggle(default)|on|off|status
   nulvoiceagent done-voice-only [x]  announce only VOICE-started tasks (typed tasks stay silent); x = toggle(default)|on|off|status
+  nulvoiceagent ledger          what phrasing she's over-using + the hint it would inject
   nulvoiceagent newtopic        forget the chat conversation context
   nulvoiceagent passive         passive-listening daemon loop (eavesdrop + occasional interjection; run via nulvoiceagent-passive.service)
   nulvoiceagent passive-toggle [x]  start/stop the eavesdrop service; x = toggle(default)|on|off|status
@@ -26,12 +27,13 @@ Global: --brain codex|claude overrides NULVOICEAGENT_BRAIN for this run.
 """
 from __future__ import annotations
 import os
+import re
 import signal
 import sys
 import time
 
-from . import (actions, askanswer, brain, config, dispatch, distill, done,
-               intents, passive, state, stt, tts, viewertts)
+from . import (actions, askanswer, brain, config, dispatch, distill, done, ledger,
+               intents, narrate, passive, state, stt, tts, viewertts)
 
 _LOG = config.CACHE_DIR / "nulvoiceagent.log"
 # PID of an in-progress manual (toggle) recording. Any hotkey press while this is
@@ -104,6 +106,22 @@ def _clear_turn() -> None:
         pass
 
 
+def _pause_narration() -> bool:
+    """Pause a running narration when a voice hotkey is pressed.
+
+    Narration deliberately runs OUTSIDE the turn's process group (so barge-in
+    can't kill it), which means it would otherwise keep reading straight into the
+    mic while he speaks. Pausing on the press is also what makes "resume" a real
+    command rather than a race. Returns True if one was paused."""
+    try:
+        if narrate.pause_for_input():
+            _log("narrate: paused (hotkey)")
+            return True
+    except Exception as e:  # noqa: BLE001 — never block listening over this
+        _log(f"narrate: pause failed: {e}")
+    return False
+
+
 def _interrupt_active_turn() -> bool:
     """If a previous turn is still thinking/speaking, kill its whole process
     group (Python + pw-play + any synth helpers) so it stops talking at once.
@@ -136,6 +154,7 @@ def _chat_toggle() -> None:
     if _stop_active_recording():
         return
     _interrupt_active_turn()         # shut up an in-progress reply, then listen
+    _pause_narration()               # ...and a narration, so the mic hears only him
     _REC_PID.write_text(str(os.getpid()))
     tts.cue("start")
     state.listening()
@@ -358,6 +377,7 @@ def main(argv: list[str]) -> int:
         # any hotkey press during a live chat recording ends it instead
         if not _stop_active_recording():
             _interrupt_active_turn()       # barge in on a still-speaking reply
+            _pause_narration()
             state.listening()
             heard = stt.listen()
             _mark_turn()
@@ -392,6 +412,33 @@ def main(argv: list[str]) -> int:
         dropped = dispatch.prune()
         if dropped:
             print(f"pruned: {', '.join(dropped)}")
+    elif cmd == "ledger":
+        # What she's been over-using, and the hint that would be injected now.
+        print(ledger.report())
+    elif cmd == "narrate-player":
+        # Internal: the detached narrator process itself (spawned by narrate.start).
+        return narrate.player_main()
+    elif cmd == "narrate":
+        # Mic-free test seam — goes through the REAL grammar so it exercises what
+        # the hotkey does: `nulvoiceagent narrate "the section about B-Trees"`.
+        utter = text.strip()
+        if not re.match(r"^\s*(?:narrate|read)\b", utter, re.IGNORECASE):
+            utter = f"narrate {utter}".strip()
+        it = intents.try_narrate(utter)
+        if it is None:
+            print("(not recognised as a narrate command)")
+        else:
+            print(it.say or "(narrating)")
+    elif cmd in ("narrate-pause", "narrate-resume", "narrate-stop"):
+        fn = {"narrate-pause": narrate.pause, "narrate-resume": narrate.resume,
+              "narrate-stop": narrate.stop}[cmd]
+        print("ok" if fn() else "no narration running")
+    elif cmd == "narrate-status":
+        st = narrate.status()
+        if st["state"] == "idle":
+            print("idle")
+        else:
+            print(f"{st['state']} — chunk {st['i'] + 1}/{st['n']}  {st['title']}")
     elif cmd == "say":
         tts.speak(text)
     elif cmd == "viewer-say":
