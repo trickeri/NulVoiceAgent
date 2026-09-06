@@ -202,6 +202,11 @@ Address an individual terminal pane (e.g. a Claude Code session) by voice:
 
 - **name** — focus a pane, hit the chat/route key, say *"name this pane Build Claude"* →
   the registry stores `Build Claude → %id` and titles the pane.
+- **unnamed panes** — the done / question announcers still say *which* Claude it was:
+  they take one keyword from the pane title Claude Code sets (*"✳ Nulium browser
+  crash logging"* → *"Nulium Claude finished the task"*), else the project from the
+  pane's cwd (`~/programming/Krita` → *"Krita Claude"*). Plain *"Claude"* only when
+  neither says anything. Off with `NULVOICEAGENT_GUESS_PANE_NAME=0`.
 - **dispatch** — *"tell Build Claude to add a double jump"* → bracketed-pastes the
   request into that pane and submits. Names are fuzzy-matched so STT slips are OK.
 - **Hermes hand-off** — in `chat` mode the Hermes brain is told which panes are

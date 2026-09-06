@@ -230,12 +230,13 @@ def _handle_chat(text: str, reset: bool = False) -> None:
         state.idle()
         return
     _log(f"you: {text}")
-    # "Summarize" right after a done announcement -> summarize that
-    # completion (decisions/gotchas/architecture in 2-3 sentences) instead of
-    # going to Hermes, which has no idea what to summarize. Falls through to chat
-    # if there's no fresh completion (so "summarize this article" still works).
+    # "Summarize" after a done announcement -> summarize that completion
+    # (decisions/gotchas/architecture in 2-3 sentences) instead of going to
+    # Hermes, which has no idea what to summarize. "Summarize Krita Claude" picks
+    # that agent's completion; bare "summarize" = the latest. Falls through to
+    # chat if nothing fresh is stashed (so "summarize this article" still works).
     if done.wants_summary_request(text):
-        summary = done.make_summary()
+        summary = done.make_summary(text)
         if summary:
             _log(f"agent: {summary}")
             tts.speak(summary)

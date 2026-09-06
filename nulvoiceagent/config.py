@@ -188,12 +188,20 @@ DONE_ENABLE = os.environ.get("NULVOICEAGENT_DONE_ENABLE", "1").strip() not in ("
 DONE_LISTEN_SECS = float(os.environ.get("NULVOICEAGENT_DONE_LISTEN_SECS", "5.0"))
 # Model for the on-demand summary (headless `claude -p`). Fast/cheap by default.
 DONE_SUMMARY_MODEL = os.environ.get("NULVOICEAGENT_DONE_SUMMARY_MODEL", "claude-haiku-4-5").strip()
+# How long an announced completion stays summarizable. Completions are kept per
+# agent name, so with several Claudes running the one you ask about may have
+# finished a while before you get to it.
+DONE_SUMMARY_TTL_SECS = float(os.environ.get("NULVOICEAGENT_DONE_SUMMARY_TTL_SECS", "900"))
 # Cap the assistant text fed to the summarizer (keeps the prompt arg sane).
 DONE_MAX_SUMMARY_CHARS = int(os.environ.get("NULVOICEAGENT_DONE_MAX_SUMMARY_CHARS", "12000"))
 # Runtime mute for completion announcements. A FILE flag, not an env var, on
 # purpose: each Stop hook spawns a fresh process, so a file checked at announce
 # time gives live mute/unmute. Contains "1" while muted; absent = on.
 DONE_MUTE_FLAG = CACHE_DIR / "done-muted"
+# When a pane has no voice-assigned name, guess ONE keyword for it from the tmux
+# pane title Claude Code sets ("✳ Nulium browser crash logging" -> "Nulium Claude")
+# or, failing that, the pane's cwd — instead of announcing a bare "Claude".
+GUESS_PANE_NAME = os.environ.get("NULVOICEAGENT_GUESS_PANE_NAME", "1").strip() not in ("0", "false", "")
 # A SECOND, independent toggle: when set, completion announcements are restricted
 # to tasks whose prompt was sent VIA VOICE (routed through dispatch into the pane).
 # Tasks you TYPED directly into a pane finish silently. Absent (default) = announce

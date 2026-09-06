@@ -33,8 +33,8 @@ _LOCK_FH = None  # kept alive for the lock's lifetime (released on process exit)
 
 # Varied confirmations per detected task type. random.choice gives the variation
 # the user asked for; the type comes from _classify(). "{who}" is filled with the
-# pane's spoken name ("Hermes Claude") so he knows WHICH Claude finished — or just
-# "Claude" when the pane isn't named.
+# pane's spoken name ("Hermes Claude") so he knows WHICH Claude finished — or a
+# one-keyword guess from the pane title / cwd ("Nulium Claude") when it isn't named.
 _PHRASES = {
     "task": [
         "{who} finished the task.",
@@ -356,6 +356,47 @@ def _is_subagent_completion(payload: dict) -> bool:
     return False
 
 
+# Transcript `entrypoint` values that mean "no human is watching this session":
+# `claude -p` / the Agent SDK record `sdk-cli` (and friends), while a real
+# terminal session records `cli`. Anything unknown is treated as interactive so a
+# new front-end never goes silently unannounced.
+_HEADLESS_ENTRYPOINTS = ("sdk",)
+
+
+def _transcript_entrypoint(path: str | None) -> str:
+    """First `entrypoint` recorded in a Claude transcript ('cli', 'sdk-cli', ...).
+
+    Reads lazily and stops at the first hit — the guard runs before we fork, so it
+    must not pay for parsing a long transcript."""
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    ep = json.loads(ln).get("entrypoint")
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(ep, str) and ep.strip():
+                    return ep.strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _is_headless_run(payload: dict) -> bool:
+    """True for a non-interactive Claude run — `claude -p` or the Agent SDK.
+
+    Those fire the same Stop hook as a real session, so without this any tool that
+    shells out to `claude -p` makes the machine announce a completion the user
+    never asked for (e.g. JobHunter's job-posting enrichment, one per refresh)."""
+    return _transcript_entrypoint(payload.get("transcript_path")).lower().startswith(
+        _HEADLESS_ENTRYPOINTS)
+
+
 def _ends_with_question(text: str) -> bool:
     """True if the assistant's final message ends on a question (a clarifying
     question it's waiting on the user to answer), ignoring trailing whitespace and
@@ -422,22 +463,22 @@ def _classify(user_text: str, asst_text: str, tools: set[str]) -> str:
 
 def _speaker(pane: str | None = None, default: str = "Claude") -> str:
     """The spoken name of THIS agent's tmux pane (e.g. 'Hermes Codex'), from the
-    given pane id (defaulting to the hook's inherited $TMUX_PANE), or `default` if
-    the pane isn't named / not tmux."""
+    given pane id (defaulting to the hook's inherited $TMUX_PANE). An unnamed pane
+    gets a one-keyword guess from its title / cwd ("Nulium Claude"); `default`
+    only when nothing identifies it (not tmux, bare "Claude Code" title in ~)."""
     if pane is None:
         pane = os.environ.get("TMUX_PANE")
-    try:
-        name = dispatch.name_for_pane(pane)
-    except Exception:  # noqa: BLE001 — never break the announce flow over a name
-        name = None
-    return name or default
+    return dispatch.speaker_for_pane(pane, default)
 
 
-# Latest announced completion, stashed so a follow-up "summarize" — said ANY time
-# (the auto-listen window OR, more importantly, the normal chat hotkey) — knows
-# what to summarize. Single latest entry: "summarize" means the one just reported.
+# Announced completions, stashed PER SPEAKER so a follow-up "summarize" — said
+# ANY time (the auto-listen window OR, more importantly, the normal chat hotkey)
+# — can name WHICH agent to summarize ("summarize Krita Claude"). A bare
+# "summarize" means the one reported most recently. File layout:
+#   {"latest": <who>, "entries": {<who>: {"kind","text","ts"}}}
+# (the pre-2026-09 single-entry {"who","kind","text","ts"} shape is still read).
 _COMPLETION = config.CACHE_DIR / "last-completion.json"
-_COMPLETION_TTL = 300.0  # seconds — don't summarize something reported ages ago
+_COMPLETION_TTL = config.DONE_SUMMARY_TTL_SECS
 _SUMMARY_KW = re.compile(r"\bsummar(?:ize|ise|y)\b", re.IGNORECASE)
 # "narrate a summary of this page" is about the PAGE in front of him, not the last
 # Claude completion — the narration intent owns anything that opens with a read/
@@ -446,46 +487,129 @@ _SUMMARY_KW = re.compile(r"\bsummar(?:ize|ise|y)\b", re.IGNORECASE)
 _NARRATE_LEAD = re.compile(
     r"^\s*(?:hey\s+|ok(?:ay)?\s+)?(?:(?:can|could|would|will)\s+you\s+)?"
     r"(?:please\s+)?(?:n[ae]rr?ate\w*|no\s+rate|read)\b", re.IGNORECASE)
+# Words that carry no target in a summarize request: "summarize THAT", "summarize
+# WHAT Krita Claude JUST DID", "give me a summary OF THE LAST ONE". Whatever is
+# left after stripping these is the spoken agent name (or nothing -> latest).
+_SUMMARY_FILLER = {
+    "hey", "ok", "okay", "please", "can", "could", "would", "will", "you", "me",
+    "give", "get", "a", "an", "the", "of", "for", "from", "on", "about", "with",
+    "what", "that", "this", "it", "its", "one", "thing", "stuff", "last", "latest",
+    "recent", "most", "just", "did", "do", "done", "does", "said", "say", "sayd",
+    "happened", "finished", "finish", "completed", "complete", "wrapped", "up",
+    "work", "task", "turn", "result", "results", "reply", "answer", "again",
+    "quick", "quickly", "brief", "briefly", "now", "then", "so", "and", "um", "uh",
+    "session", "sessions",
+}
+_SUMMARY_VERB = re.compile(r"\b(?:summar(?:ize|ise|y)|sum\s+up)\b", re.IGNORECASE)
+
+
+def _read_completions() -> dict:
+    """Live (unexpired) completions keyed by speaker name, plus the latest name.
+    Returns {"latest": str|None, "entries": {who: {...}}}; empty when nothing."""
+    try:
+        d = json.loads(_COMPLETION.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"latest": None, "entries": {}}
+    if not isinstance(d, dict):
+        return {"latest": None, "entries": {}}
+    if "entries" not in d:                       # legacy single-entry shape
+        who = d.get("who") or "Claude"
+        d = {"latest": who, "entries": {who: {k: d.get(k) for k in ("kind", "text", "ts")}}}
+    now = time.time()
+    entries = {who: e for who, e in (d.get("entries") or {}).items()
+               if isinstance(e, dict) and now - float(e.get("ts") or 0) <= _COMPLETION_TTL}
+    latest = d.get("latest")
+    if latest not in entries:
+        latest = max(entries, key=lambda w: float(entries[w].get("ts") or 0)) if entries else None
+    return {"latest": latest, "entries": entries}
 
 
 def _stash_completion(who: str, kind: str, text: str) -> None:
+    d = _read_completions()
+    d["entries"][who] = {"kind": kind, "text": text, "ts": time.time()}
+    d["latest"] = who
     try:
-        _COMPLETION.write_text(
-            json.dumps({"who": who, "kind": kind, "text": text, "ts": time.time()}),
-            encoding="utf-8")
+        _COMPLETION.write_text(json.dumps(d), encoding="utf-8")
     except OSError:
         pass
 
 
 def _read_completion() -> dict | None:
-    try:
-        d = json.loads(_COMPLETION.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    """The most recently announced completion (legacy accessor)."""
+    d = _read_completions()
+    who = d["latest"]
+    if who is None:
         return None
-    if time.time() - float(d.get("ts", 0)) > _COMPLETION_TTL:
-        return None
-    return d
+    return {"who": who, **d["entries"][who]}
 
 
 def wants_summary_request(text: str) -> bool:
     """True if `text` is a bare 'summarize' command (e.g. 'summarize', 'summarize
-    that', 'summarize what Krita Claude just did') — short + contains the keyword.
+    that', 'summarize what Krita Claude 2 just did') — short + contains the keyword.
     The word cap keeps a real chat request like 'summarize this 5-page doc …' out;
     even so, make_summary() only fires when there's a FRESH completion to summarize,
     otherwise the caller falls through to normal chat."""
     t = (text or "").strip()
     if _NARRATE_LEAD.match(t):
         return False
-    return bool(_SUMMARY_KW.search(t)) and len(t.split()) <= 8
+    return bool(_SUMMARY_KW.search(t)) and len(t.split()) <= 10
 
 
-def make_summary() -> str | None:
-    """Summarize the most recently announced completion. Returns the spoken summary,
-    or None when there's no fresh completion (caller should fall through to chat)."""
-    d = _read_completion()
-    if d is None:
+def _summary_target(text: str) -> str:
+    """The spoken agent name inside a summarize request, or "" for a bare one.
+    "summarize what Krita Claude 2 just did" -> "krita claude 2"."""
+    t = _SUMMARY_VERB.sub(" ", (text or "").lower())
+    toks = [w for w in dispatch._norm(t).split() if w not in _SUMMARY_FILLER]
+    return " ".join(toks)
+
+
+def resolve_summary_target(text: str, completions: dict | None = None) -> tuple[str | None, str | None]:
+    """Pick which stashed completion a summarize request means.
+
+    Returns (who, problem): `who` is a key of the live entries (the latest one for
+    a bare request), or None with a spoken `problem` when the request names an
+    agent nothing fresh was heard from. (None, None) means nothing is stashed at
+    all — the caller should fall through to chat."""
+    d = completions if completions is not None else _read_completions()
+    entries = d["entries"]
+    if not entries:
+        return None, None
+    spoken = _summary_target(text)
+    if not spoken:
+        return d["latest"], None
+    hit = dispatch._match_key(spoken, entries)
+    if hit is not None:
+        return hit, None
+    # A shared prefix of several ("rice" -> Rice Claude / Rice Codex): ask, don't guess.
+    amb = dispatch.ambiguous_matches(spoken, entries)
+    if len(amb) >= 2:
+        return None, "Which one: " + " or ".join(amb) + "?"
+    # Named something we have no fresh completion from. Report it rather than
+    # summarizing whoever happened to finish last — but only when it plausibly IS
+    # an agent name: ends in a pane word ("VTuber Claude"), is a live pane that
+    # simply hasn't finished, or is a close mishearing of a stashed name. An
+    # unrelated tail ("summarize that mess") still means the latest one.
+    if (dispatch._looks_like_pane_name(spoken)
+            or dispatch._match_key(spoken, dispatch.load()) is not None
+            or any(dispatch._ratio(dispatch._norm(k), spoken) >= 0.55 for k in entries)):
+        known = ", ".join(sorted(entries))
+        return None, (f"I haven't heard {spoken.title()} finish anything lately. "
+                      f"I have recent results from {known}.")
+    return d["latest"], None
+
+
+def make_summary(request: str = "") -> str | None:
+    """Summarize an announced completion — the one `request` names ("summarize
+    Krita Claude"), or the most recent for a bare "summarize". Returns the spoken
+    summary, or None when there's no fresh completion at all (caller should fall
+    through to chat)."""
+    who, problem = resolve_summary_target(request)
+    if problem:
+        _log(f"summarize: {problem!r}")
+        return problem
+    if who is None:
         return None
-    who = d.get("who", "the agent")
+    d = _read_completions()["entries"].get(who) or {}
     text = (d.get("text") or "").strip()
     if not text:
         return f"{who} didn't leave any detail I can summarize."
@@ -541,6 +665,9 @@ def run(payload: dict, default_who: str = "Claude") -> None:
     if _is_subagent_completion(payload):
         _log("skip: subagent completion")
         return
+    if _is_headless_run(payload):
+        _log("skip: headless run (claude -p / SDK)")
+        return
     if not config.DONE_ENABLE or is_muted():
         return
     if _acquire_lock() is None:
@@ -575,7 +702,7 @@ def run(payload: dict, default_who: str = "Claude") -> None:
         return
     _log(f"heard: {heard!r}")
     if _SUMMARY_KW.search(heard):
-        tts.speak(make_summary() or "There wasn't really anything to summarize.")
+        tts.speak(make_summary(heard) or "There wasn't really anything to summarize.")
 
 
 def run_detached(payload: dict, default_who: str = "Claude") -> None:
@@ -583,6 +710,9 @@ def run_detached(payload: dict, default_who: str = "Claude") -> None:
     once, so the Stop hook doesn't block Claude Code's prompt."""
     if _is_subagent_completion(payload):
         _log("skip detach: subagent completion")
+        return
+    if _is_headless_run(payload):
+        _log("skip detach: headless run (claude -p / SDK)")
         return
     if not config.DONE_ENABLE or is_muted():
         return                       # don't even fork when off / muted

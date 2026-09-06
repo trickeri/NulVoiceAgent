@@ -529,7 +529,7 @@ def _resolve_pane(rest: str) -> tuple[Optional[str], Optional[str], Optional[str
     live = _live_selector_panes()
     if len(live) == 1:
         pane = live[0]
-        return pane, dispatch.name_for_pane(pane) or "that pane", None
+        return pane, dispatch.speaker_for_pane(pane, "Claude"), None
     if len(live) > 1:
         return None, None, "More than one pane is asking — say which one, like answer the Build Claude."
     return None, None, "Nothing's waiting on an answer right now."
@@ -652,10 +652,7 @@ def announce_payload(payload: dict) -> None:
     questions = (payload.get("tool_input") or {}).get("questions") or []
     if not isinstance(questions, list) or not questions:
         return
-    try:
-        who = dispatch.name_for_pane(pane) or "Claude"
-    except Exception:  # noqa: BLE001 — never break the announce over a name lookup
-        who = "Claude"
+    who = dispatch.speaker_for_pane(pane, "Claude")   # named, else "<Keyword> Claude"
     _record_pending(pane, who, questions)   # synchronous: always recorded
     # Voice-only mode: only NUDGE for prompts inside a voice-initiated task. A task
     # the user typed in gets no spoken nudge (the pending record still stands, so he

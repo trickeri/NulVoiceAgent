@@ -16,8 +16,11 @@ sides are normalized (lowercase, alnum-only, single-spaced) before matching.
 """
 from __future__ import annotations
 
+import getpass
 import json
+import os
 import re
+import socket
 import subprocess
 import time
 from difflib import SequenceMatcher
@@ -141,6 +144,194 @@ def name_for_pane(pane: Optional[str]) -> Optional[str]:
         if d.get("pane") == pane:
             return n
     return None
+
+
+# --------------------------------------------------------------------------- #
+# guessing a label for an UNNAMED pane                                         #
+# --------------------------------------------------------------------------- #
+# When a pane was never named by voice, the announcers used to fall back to a bare
+# "Claude" — useless with five Claudes open. Claude Code sets the pane title to a
+# short topic ("✳ Nulium browser crash logging", "✳ Voice agent Claude
+# identification"), and the pane's cwd is the project. From those we pick ONE
+# keyword ("Nulium", "Voice") so the announcement is "Nulium Claude finished".
+# A voice-assigned @va_name always wins; this is only the fallback.
+
+# Titles that carry no topic: Claude Code's pre-topic default, the bare agent
+# names, and what shells put there (hostname / user / shell name).
+_TITLE_NOISE = {"claude code", "claude", "codex", "code", "terminal", "shell",
+                "zsh", "bash", "fish", "sh", "tmux", "node", "python"}
+try:
+    _TITLE_NOISE |= {socket.gethostname().lower(), socket.gethostname().split(".")[0].lower(),
+                     (os.environ.get("USER") or getpass.getuser()).lower()}
+except Exception:  # noqa: BLE001 — a weird box must not break import
+    pass
+_TITLE_NOISE.discard("")
+# "user@host: ~/x" — the classic shell title. The topic-less pane is identified by
+# its cwd instead.
+_SHELL_TITLE = re.compile(r"^\S+@\S+")
+
+# Words that never identify a task on their own. Function words plus the generic
+# dev vocabulary that shows up in nearly every Claude title ("fix", "bug",
+# "logging", ...). If EVERYTHING in a title is filtered we fall back to its first
+# real word, then to the cwd — so over-filtering only costs specificity.
+_LABEL_STOP = {
+    # function words
+    "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "for", "from",
+    "with", "without", "by", "at", "as", "is", "are", "was", "be", "vs", "via",
+    "into", "onto", "over", "under", "up", "down", "out", "off", "not", "no",
+    "this", "that", "these", "those", "it", "its", "my", "our", "your", "his",
+    "her", "their", "some", "any", "all", "more", "less", "new", "old", "how",
+    "what", "when", "where", "why", "which", "who",
+    # agent / tooling generic
+    "claude", "codex", "code", "agent", "agents", "session", "sessions", "ai",
+    "assistant", "chat", "prompt", "hook", "hooks", "tool", "tools", "cli",
+    # generic dev vocabulary
+    "fix", "fixes", "fixing", "fixed", "bug", "bugs", "issue", "issues", "error",
+    "errors", "crash", "crashes", "crashing", "log", "logs", "logging", "debug",
+    "debugging", "update", "updates", "updating", "add", "adding", "added",
+    "remove", "removing", "setup", "set", "config", "configuration", "configure",
+    "refactor", "refactoring", "cleanup", "clean", "implement", "implementing",
+    "implementation", "feature", "features", "support", "integration",
+    "integrate", "help", "question", "questions", "work", "working", "review",
+    "reviewing", "test", "tests", "testing", "file", "files", "task", "tasks",
+    "change", "changes", "changing", "improve", "improving", "improvement",
+    "improvements", "build", "building", "run", "running", "check", "checking",
+    "investigate", "investigation", "plan", "planning", "design", "script",
+    "scripts", "function", "functions", "method", "class", "module", "api",
+    "issue", "problem", "problems", "handling", "handler", "identification",
+    "detection", "truncation", "timeout", "performance", "optimization",
+    "project", "repo", "repository", "system", "service", "services",
+    "server", "client", "app", "application", "page", "data", "text", "speech",
+}
+
+# Directories whose basename says nothing about a project: the cwd fallback
+# yields no label from these (a Claude sitting in ~/programming is just "Claude").
+_GENERIC_DIRS = {"", "/", "programming", "gameprod", "projects", "project", "src",
+                 "code", "dev", "work", "repos", "git", "documents", "downloads",
+                 "desktop", "tmp", "home"}
+
+
+def pane_context(pane: Optional[str]) -> tuple[str, str]:
+    """(pane_title, pane_current_path) for a tmux pane id — both "" on failure."""
+    if not pane:
+        return "", ""
+    cp = _tmux("display-message", "-p", "-t", pane, "#{pane_title}\t#{pane_current_path}")
+    if cp.returncode != 0:
+        return "", ""
+    title, _, cwd = cp.stdout.rstrip("\n").partition("\t")
+    return title.strip(), cwd.strip()
+
+
+def _split_camel(s: str) -> str:
+    """'NulVoiceAgent' -> 'Nul Voice Agent'; 'JobHunter' -> 'Job Hunter'. Leaves
+    all-caps runs together ('OBS' stays 'OBS', 'NulVP' -> 'Nul VP')."""
+    s = re.sub(r"[_\-.]+", " ", s)
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", s)
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _spoken_word(w: str) -> str:
+    """Title-case a plain word; keep deliberate casing ('WoW', 'OBS', 'NulVP');
+    spell out a vowel-less short word as an acronym ('tts' -> 'TTS')."""
+    if re.search(r"[A-Z]", w[1:]) or w.isupper():
+        return w
+    if len(w) <= 4 and not re.search(r"[aeiouy]", w, re.IGNORECASE):
+        return w.upper()
+    return w[:1].upper() + w[1:]
+
+
+def keyword_from_title(title: str, cwd: str = "") -> Optional[str]:
+    """ONE word that best names what a pane is working on, from its title.
+
+    Strips the leading spinner glyph, ignores content-free titles, and scores
+    the remaining words: a word echoed by the cwd ("voice" in NulVoiceAgent)
+    wins outright, then a proper noun (capitalized mid-sentence, or oddly cased
+    like "WoW"), then the leading word — Claude's titles put the topic first.
+    Stop words (function words + generic dev vocabulary) only get used when
+    nothing else survives."""
+    t = re.sub(r"^[^A-Za-z0-9]+", "", title or "").strip()   # drop "✳ " / spinners
+    if not t or _norm(t) in _TITLE_NOISE or _SHELL_TITLE.match(t):
+        return None
+    words = [w.strip("\"'`.,:;!?()[]{}<>") for w in t.split()]
+    words = [w for w in words if re.search(r"[A-Za-z0-9]", w)]
+    if not words:
+        return None
+    base = os.path.basename(cwd.rstrip("/")).lower() if cwd else ""
+    parent = os.path.basename(os.path.dirname(cwd.rstrip("/"))).lower() if cwd else ""
+    dirs = {d for d in (base, parent) if d and d not in _GENERIC_DIRS}
+
+    def score(i: int, w: str) -> float:
+        lw = w.lower()
+        s = 0.0
+        if len(w) < 3 and not w.isupper():
+            return -1.0                      # "X", "to", "a"
+        if any(len(lw) >= 4 and (lw in d or d in lw) for d in dirs):
+            s += 4                           # echoes the project directory
+        if w[:1].isupper():
+            s += 3                           # proper noun — or the leading topic word
+        elif re.search(r"[A-Z]", w[1:]) or re.search(r"\d", w):
+            s += 2                           # x264 / iOS
+        return s
+
+    # Ties go to the earlier word (Claude's titles lead with the topic), then the
+    # longer one.
+    candidates = [(score(i, w), -i, len(w), w) for i, w in enumerate(words)
+                  if w.lower() not in _LABEL_STOP]
+    candidates = [c for c in candidates if c[0] >= 0]
+    if not candidates:                       # everything was generic ("Fix bug")
+        return None
+    candidates.sort(reverse=True)
+    return _spoken_word(candidates[0][3])
+
+
+def _first_real_word(title: str) -> Optional[str]:
+    """Last resort for an all-generic title ("Fix bug" -> "Fix")."""
+    t = re.sub(r"^[^A-Za-z0-9]+", "", title or "").strip()
+    if not t or _norm(t) in _TITLE_NOISE or _SHELL_TITLE.match(t):
+        return None
+    for w in t.split():
+        w = w.strip("\"'`.,:;!?()[]{}<>")
+        if len(w) >= 3 and w.lower() not in _TITLE_NOISE:
+            return _spoken_word(w)
+    return None
+
+
+def label_from_cwd(cwd: str) -> Optional[str]:
+    """The project name from a pane's cwd ('.../NulVoiceAgent' -> 'Nul Voice
+    Agent'), or None for home / a generic parent directory."""
+    cwd = (cwd or "").rstrip("/")
+    if not cwd or cwd == os.path.expanduser("~"):
+        return None
+    base = os.path.basename(cwd)
+    if base.lower() in _GENERIC_DIRS:
+        return None
+    return _split_camel(base) or None
+
+
+def guess_pane_label(pane: Optional[str]) -> Optional[str]:
+    """Best-guess ONE-keyword label for an unnamed pane: a topic word from its
+    title, else the project from its cwd, else the title's first real word; None
+    when nothing says anything ('✳ Claude Code' in ~/programming)."""
+    title, cwd = pane_context(pane)
+    return keyword_from_title(title, cwd) or label_from_cwd(cwd) or _first_real_word(title)
+
+
+def speaker_for_pane(pane: Optional[str], default: str = "Claude") -> str:
+    """The spoken name for the agent in `pane`: its voice-assigned name ("Krita
+    Claude") if it has one, else a guessed "<Keyword> <default>" ("Nulium
+    Claude") from the pane title / cwd, else just `default`."""
+    try:
+        name = name_for_pane(pane)
+        if name:
+            return name
+        if config.GUESS_PANE_NAME:
+            kw = guess_pane_label(pane)
+            if kw:
+                return f"{kw} {default}"
+    except Exception:  # noqa: BLE001 — never break an announce over a name lookup
+        pass
+    return default
 
 
 # --------------------------------------------------------------------------- #
