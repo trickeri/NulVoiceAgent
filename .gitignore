@@ -9,3 +9,4 @@ __pycache__/
 .codex/
 .graphifyignore
 graphify-out/
+.omo/

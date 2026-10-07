@@ -20,7 +20,11 @@ Per overheard utterance, cheapest gates first:
   4. roll PASSIVE_PROB — most utterances are never even considered;
   5. STT; skip if under PASSIVE_MIN_WORDS;
   6. brain.eavesdrop() -> either PASS (she holds her tongue) or a remark,
-     spoken through the normal Miku/Aurinex TTS path.
+     spoken through the normal Miku/Aurinex TTS path;
+  7. if she spoke, a short follow-up window (PASSIVE_FOLLOWUP_SECS): if he starts
+     talking again within it, that's taken as a reply to her and answered via
+     brain.eavesdrop_reply() — repeated after each answer, so a little
+     back-and-forth can happen (still chat-only), up to PASSIVE_FOLLOWUP_MAX_TURNS.
 
 The think+speak phase runs in a forked child with its own process group,
 registered in turn.pgid — so a voice hotkey barges in on an interjection
@@ -164,12 +168,24 @@ class _BusyWatch:
         with self._lock:
             return self._busy
 
-    def busy_since(self, mark: float) -> bool:
+    def busy_since(self, mark: float, grace: float | None = None) -> bool:
         """Was a hotkey turn live at any sampled moment since `mark`
-        (monotonic), including the PASSIVE_BUSY_GRACE_SECS run-up to it?"""
+        (monotonic), including the `grace` (default PASSIVE_BUSY_GRACE_SECS)
+        run-up to it?"""
+        grace = config.PASSIVE_BUSY_GRACE_SECS if grace is None else grace
         with self._lock:
             busy, last = self._busy, self._last_busy
-        return busy or (last > 0.0 and last >= mark - config.PASSIVE_BUSY_GRACE_SECS)
+        return busy or (last > 0.0 and last >= mark - grace)
+
+    def wait_idle(self, timeout: float) -> bool:
+        """Wait (up to `timeout`) for the sampler to see idle — right after her
+        own speech it still reads 'talking' for up to one poll."""
+        end = time.monotonic() + timeout
+        while self.busy():
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.05)
+        return True
 
 
 def _cooldown_left() -> float:
@@ -213,17 +229,30 @@ def _speak_guard(turn) -> None:
         return
 
 
-def _interject(text: str) -> None:
+_SPOKE = 0       # child exit status: she finished saying something
+_SILENT = 3      # PASS / dropped / error — nothing (fully) said
+
+
+def _interject(text: str, history: list | None = None) -> tuple[bool, str]:
     """Think + (maybe) speak in a forked child with its own pgroup, registered
     as the active turn so a hotkey press can barge in on it (killing the child,
-    not the daemon). The parent waits, so capture never runs over her speech."""
+    not the daemon). The parent waits, so capture never runs over her speech.
+    Returns (spoke, reply): spoke is True only if she spoke to the end (a
+    barge-in kill or a PASS -> False), which is what opens the follow-up window;
+    reply is her line (piped back from the child) for the exchange transcript.
+    `history` given = he's answering her (follow-up turn)."""
+    rfd, wfd = os.pipe()
     pid = os.fork()
     if pid:
+        os.close(wfd)
+        with os.fdopen(rfd, "rb") as r:
+            said = r.read().decode("utf-8", "replace")   # EOF when the child exits
         try:
-            os.waitpid(pid, 0)
+            _, status = os.waitpid(pid, 0)
         except OSError:
-            pass
-        return
+            return False, said
+        return os.WIFEXITED(status) and os.WEXITSTATUS(status) == _SPOKE, said
+    os.close(rfd)
     # child
     os.setsid()
     turn = config.CACHE_DIR / "turn.pgid"
@@ -231,10 +260,12 @@ def _interject(text: str) -> None:
         turn.write_text(str(os.getpgrp()))
     except OSError:
         pass
+    rc = _SILENT
     try:
         state.thinking()
         t0 = time.monotonic()
-        reply = brain.eavesdrop(text)
+        reply = (brain.eavesdrop_reply(text, history) if history is not None
+                 else brain.eavesdrop(text))
         secs = time.monotonic() - t0
         if brain.is_pass(reply):
             _log(f"passive: PASS  (brain={secs:.2f}s)")
@@ -248,9 +279,15 @@ def _interject(text: str) -> None:
             state.idle()
         else:
             _log(f"passive: say: {reply!r}  (brain={secs:.2f}s)")
+            try:
+                os.write(wfd, reply.encode("utf-8"))
+                os.close(wfd)
+            except OSError:
+                pass
             threading.Thread(target=_speak_guard, args=(turn,),
                              daemon=True).start()
             tts.speak(reply)          # publishes talking/idle states itself
+            rc = _SPOKE
     except Exception as e:            # never let one bad turn kill the child oddly
         _log(f"passive: error: {e}")
         state.idle()
@@ -259,16 +296,106 @@ def _interject(text: str) -> None:
             turn.unlink()
         except OSError:
             pass
-    os._exit(0)
+    os._exit(rc)
+
+
+def _keep_wav(wav: bytes, tag: str) -> str:
+    """Save a follow-up capture to PASSIVE_DEBUG_DIR (ring of the newest
+    PASSIVE_DEBUG_KEEP) so a missed reply can be listened to. Returns the name."""
+    d = config.PASSIVE_DEBUG_DIR
+    name = f"{time.strftime('%H%M%S')}-{tag}.wav"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_bytes(wav)
+        old = sorted(d.glob("*.wav"), key=lambda p: p.stat().st_mtime)
+        for p in old[:-config.PASSIVE_DEBUG_KEEP]:
+            p.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return name
+
+
+# Non-word captures left before an empty transcript ends the exchange. Reset at
+# the start of each exchange (the main loop's first interjection).
+_blips_left = 0
+
+# Set when a follow-up window closes empty: (monotonic deadline, history). The
+# main loop's next capture continues the exchange if its ONSET beats the deadline.
+_late_reply: tuple[float, list] | None = None
+
+
+def _followup(watch: _BusyWatch, history: list) -> None:
+    """She just spoke: give him PASSIVE_FOLLOWUP_SECS to start answering. Each
+    reply he makes is answered (eavesdrop_reply), and the window re-opens after
+    every answer she speaks. Ends on silence, a PASS, a hotkey/dictation turn,
+    or PASSIVE_FOLLOWUP_MAX_TURNS replies. No dice / word minimum here — "yeah,
+    right?" is a perfectly good answer to her. `history` (the exchange so far,
+    (speaker, line) pairs) is sent with every reply and grown as it goes."""
+    global _late_reply, _blips_left
+    window = config.PASSIVE_FOLLOWUP_SECS
+    while True:
+        n = sum(1 for who, _ in history if who == "user") - 1   # replies so far
+        if n >= config.PASSIVE_FOLLOWUP_MAX_TURNS:
+            _log(f"passive: follow-up ended (max {config.PASSIVE_FOLLOWUP_MAX_TURNS} replies)")
+            return
+        if window <= 0:
+            return
+        her_end = time.monotonic()
+        if not watch.wait_idle(1.0):
+            _log("passive: follow-up -> skip (busy after her line)")
+            return
+        mark = time.monotonic()
+        info: dict = {}
+        wav = stt.record(max_secs=window + config.PASSIVE_MAX_SECS,
+                         onset_timeout=window,
+                         trail_silence=config.PASSIVE_TRAIL, info=info,
+                         open_db=config.PASSIVE_FOLLOWUP_GATE_OPEN_DB,
+                         close_db=config.PASSIVE_FOLLOWUP_GATE_CLOSE_DB)
+        lag = info.get("t0", mark) - her_end
+        if not wav:
+            _log(f"passive: follow-up window closed ({window:g}s, mic open +{lag:.2f}s "
+                 f"after her line, no onset; loudest {info.get('peak_db', -120):.1f} dB vs "
+                 f"gate {config.PASSIVE_FOLLOWUP_GATE_OPEN_DB:g} dB) — late grace "
+                 f"{config.PASSIVE_FOLLOWUP_LATE_SECS:g}s")
+            if config.PASSIVE_FOLLOWUP_LATE_SECS > 0:
+                _late_reply = (time.monotonic() + config.PASSIVE_FOLLOWUP_LATE_SECS,
+                               history)
+            return
+        dur = state.wav_duration(wav)
+        clip = _keep_wav(wav, f"reply{n + 1}")
+        _log(f"passive: follow-up onset +{info['onset']:.2f}s into the window "
+             f"(mic open +{lag:.2f}s after her line; {dur:.1f}s captured -> {clip})")
+        # grace=0: her own speech ended just before `mark` and must not count.
+        if watch.busy_since(mark, grace=0.0):
+            _log("passive: follow-up -> skip (hotkey turn)")
+            return
+        text = stt.transcribe(wav).strip()
+        if not text:
+            if _blips_left > 0:
+                _blips_left -= 1
+                _log(f"passive: follow-up heard no words ({dur:.1f}s, {clip}) -> "
+                     f"still listening ({_blips_left} blip retries left)")
+                continue
+            _log(f"passive: follow-up ended (no words in {dur:.1f}s, {clip}; "
+                 f"blip retries used up)")
+            return
+        _log(f"passive: reply {n + 1}: {text}")
+        spoke, said = _interject(text, history)
+        if not spoke:
+            _log("passive: follow-up ended (she passed / was interrupted)")
+            return
+        history += [("user", text), ("her", said)]
 
 
 def run() -> int:
+    global _late_reply, _blips_left
     if not _single_instance():
         print("passive: already running", file=sys.stderr)
         return 1
     _log(f"passive: up  (prob={config.PASSIVE_PROB:g} "
          f"cooldown={config.PASSIVE_COOLDOWN_SECS:g}s "
-         f"min={config.PASSIVE_MIN_SECS:g}s words>={config.PASSIVE_MIN_WORDS})")
+         f"min={config.PASSIVE_MIN_SECS:g}s words>={config.PASSIVE_MIN_WORDS} "
+         f"followup={config.PASSIVE_FOLLOWUP_SECS:g}s x{config.PASSIVE_FOLLOWUP_MAX_TURNS})")
     watch = _BusyWatch()
     watch.start()
     while True:
@@ -277,13 +404,50 @@ def run() -> int:
             time.sleep(1.0)
             continue
         mark = time.monotonic()
+        info: dict = {}
+        # Right after a follow-up window, the late-reply capture keeps the
+        # sensitive reply gate; otherwise the normal overhearing gate.
+        gate = ({"open_db": config.PASSIVE_FOLLOWUP_GATE_OPEN_DB,
+                 "close_db": config.PASSIVE_FOLLOWUP_GATE_CLOSE_DB}
+                if _late_reply is not None else {})
         wav = stt.record(
             max_secs=config.PASSIVE_ONSET_WAIT + config.PASSIVE_MAX_SECS,
             onset_timeout=config.PASSIVE_ONSET_WAIT,
-            trail_silence=config.PASSIVE_TRAIL)
+            trail_silence=config.PASSIVE_TRAIL, info=info, **gate)
+        late, _late_reply = _late_reply, None    # only the very next capture
         if not wav:
             continue                  # onset window elapsed silently; recycle
         dur = state.wav_duration(wav)
+        if late is not None:
+            deadline, history = late
+            onset_at = info["t0"] + (info["onset"] or 0.0)
+            over = onset_at - (deadline - config.PASSIVE_FOLLOWUP_LATE_SECS)
+            if onset_at <= deadline and not watch.busy_since(mark, grace=0.0):
+                text = stt.transcribe(wav).strip()
+                clip = _keep_wav(wav, "late")
+                _log(f"passive: LATE reply (onset +{over:.2f}s after the window "
+                     f"closed; {dur:.1f}s -> {clip}): {text}")
+                if not text and _blips_left > 0:
+                    # A laugh / "mmm" right at the edge: keep the exchange open
+                    # for one more full window + grace instead of dropping it.
+                    _blips_left -= 1
+                    _late_reply = (time.monotonic() + config.PASSIVE_FOLLOWUP_SECS
+                                   + config.PASSIVE_FOLLOWUP_LATE_SECS, history)
+                    _log(f"passive: late capture had no words -> still listening "
+                         f"({_blips_left} blip retries left)")
+                    continue
+                if not text:
+                    _log("passive: follow-up ended (no words; blip retries used up)")
+                if text:
+                    spoke, said = _interject(text, history)
+                    if spoke:
+                        _followup(watch, history + [("user", text), ("her", said)])
+                    else:
+                        _log("passive: follow-up ended (she passed / was interrupted)")
+                    _stamp_cooldown()
+                continue
+            _log(f"passive: next speech began +{over:.2f}s after the window closed "
+                 f"-> too late for a reply, treated as overheard")
         # Discard if a hotkey turn overlapped the capture AT ALL — a push-to-talk
         # press, command-mode listening, her own reply, or a voicechat dictation.
         # Whatever we just recorded was said ON a key, so it isn't ours to hear.
@@ -305,5 +469,9 @@ def run() -> int:
             continue
         _stamp_cooldown()             # every brain call pays the cooldown
         _log(f"passive: overheard: {text}")
-        _interject(text)
+        _blips_left = config.PASSIVE_FOLLOWUP_BLIP_RETRIES
+        spoke, said = _interject(text)
+        if spoke:
+            _followup(watch, [("user", text), ("her", said)])
+            _stamp_cooldown()         # cooldown runs from the END of the exchange
     return 0

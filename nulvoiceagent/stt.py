@@ -8,6 +8,7 @@ import math
 import re
 import signal
 import subprocess
+import time
 import urllib.request
 import wave
 
@@ -77,7 +78,8 @@ def record_manual(max_secs: float | None = None, level_cb=None) -> bytes:
 
 
 def record(max_secs: float | None = None, onset_timeout: float | None = None,
-           trail_silence: float | None = None) -> bytes:
+           trail_silence: float | None = None, info: dict | None = None,
+           open_db: float | None = None, close_db: float | None = None) -> bytes:
     """Record one utterance with a hysteresis noise gate, return WAV bytes.
 
     Two thresholds (dBFS), like the OBS gate on this mic: the gate OPENS once the
@@ -85,11 +87,18 @@ def record(max_secs: float | None = None, onset_timeout: float | None = None,
     it never starts a capture), then stays open until the level holds below
     GATE_CLOSE_DB for `trail_silence` (end of turn). A short pre-roll is kept so
     the onset isn't clipped. Returns b"" if nothing crossed the open threshold.
+
+    `info`, if given, is filled for diagnostics/timing: t0 (time.monotonic() at
+    mic open), onset (seconds after t0 the gate opened, None if never), peak_db
+    (loudest frame BEFORE onset), elapsed (seconds recorded). `open_db`/`close_db`
+    override the gate thresholds for this capture (e.g. a more sensitive gate
+    when a reply is expected).
     """
     max_secs = config.GATE_MAX_SECS if max_secs is None else max_secs
     onset_timeout = config.GATE_ONSET_TIMEOUT if onset_timeout is None else onset_timeout
     trail_silence = config.GATE_TRAIL if trail_silence is None else trail_silence
-    open_db, close_db = config.GATE_OPEN_DB, config.GATE_CLOSE_DB
+    open_db = config.GATE_OPEN_DB if open_db is None else open_db
+    close_db = config.GATE_CLOSE_DB if close_db is None else close_db
 
     cmd = ["parec", "--format=s16le", f"--rate={config.SAMPLE_RATE}",
            "--channels=1", "--latency-msec=30"]
@@ -104,6 +113,9 @@ def record(max_secs: float | None = None, onset_timeout: float | None = None,
     silent_run = 0.0     # time held below CLOSE after onset
     elapsed = 0.0
     frame_dt = _FRAME / config.SAMPLE_RATE
+    peak_pre = -120.0
+    if info is not None:
+        info.update(t0=time.monotonic(), onset=None, peak_db=-120.0, elapsed=0.0)
     try:
         while elapsed < max_secs:
             chunk = proc.stdout.read(_BYTES)
@@ -112,11 +124,14 @@ def record(max_secs: float | None = None, onset_timeout: float | None = None,
             elapsed += frame_dt
             db = _dbfs(chunk)
             if not started:
+                peak_pre = max(peak_pre, db)
                 if db >= open_db:
                     open_run += frame_dt
                     preroll.append(chunk)
                     if open_run >= config.GATE_ATTACK:
                         started = True
+                        if info is not None:
+                            info["onset"] = elapsed
                         frames += b"".join(preroll)   # include pre-roll + onset
                         preroll.clear()
                 else:
@@ -138,6 +153,8 @@ def record(max_secs: float | None = None, onset_timeout: float | None = None,
                     # still triggers when you've actually stopped over music.
                     silent_run = max(0.0, silent_run - frame_dt * config.GATE_LEAK)
     finally:
+        if info is not None:
+            info.update(peak_db=peak_pre, elapsed=elapsed)
         proc.terminate()
         try:
             proc.wait(timeout=1)

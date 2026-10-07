@@ -178,6 +178,15 @@ LAYER_GAIN = os.environ.get("NULVOICEAGENT_LAYER_GAIN", _PROFILE.get("LAYER_GAIN
 LAYER_LEAD_HPF = os.environ.get("NULVOICEAGENT_LAYER_LEAD_HPF", _PROFILE.get("LAYER_LEAD_HPF", "400")).strip()
 LAYER_DOWN_LPF = os.environ.get("NULVOICEAGENT_LAYER_DOWN_LPF", _PROFILE.get("LAYER_DOWN_LPF", "4000")).strip()
 
+# Word-timed caption of everything she says -> $CACHE/caption.json, for an optional
+# reader such as the desktop speech-bubble overlay (see caption.py). CAPTION_DELAY
+# (seconds) shifts the caption later to cover playback start-up / FX-chain latency.
+CAPTION = os.environ.get("NULVOICEAGENT_CAPTION", _PROFILE.get("CAPTION", "1")).strip() not in ("0", "false", "")
+try:
+    CAPTION_DELAY = float(os.environ.get("NULVOICEAGENT_CAPTION_DELAY", _PROFILE.get("CAPTION_DELAY", "0.08")))
+except ValueError:
+    CAPTION_DELAY = 0.08
+
 # --- "agent is done" announcer (Claude/Codex Stop hooks) ---------------------
 # Speak a short confirmation when a Claude Code or Codex turn finishes, then
 # listen briefly for "summarize" and, if heard, speak a 2-3 sentence summary of
@@ -233,6 +242,31 @@ PASSIVE_COOLDOWN_SECS = float(os.environ.get("NULVOICEAGENT_PASSIVE_COOLDOWN_SEC
 PASSIVE_MIN_SECS = float(os.environ.get("NULVOICEAGENT_PASSIVE_MIN_SECS", "2.0"))
 PASSIVE_MAX_SECS = float(os.environ.get("NULVOICEAGENT_PASSIVE_MAX_SECS", "30.0"))
 PASSIVE_TRAIL = float(os.environ.get("NULVOICEAGENT_PASSIVE_TRAIL", "1.2"))
+# Back-and-forth: after she actually SPEAKS a remark, keep the mic open this many
+# seconds for Trickery to start replying; if he does, she answers (still chat-only)
+# and the window re-opens after each answer, up to PASSIVE_FOLLOWUP_MAX_TURNS
+# replies. 0 disables. The cooldown is re-stamped when the exchange ends.
+PASSIVE_FOLLOWUP_SECS = float(os.environ.get("NULVOICEAGENT_PASSIVE_FOLLOWUP_SECS", "2.0"))
+PASSIVE_FOLLOWUP_MAX_TURNS = int(os.environ.get("NULVOICEAGENT_PASSIVE_FOLLOWUP_MAX_TURNS", "6"))
+# Late-reply grace: if the NEXT utterance after a closed follow-up window starts
+# within this many seconds of the close, it's still taken as a reply to her (with
+# the exchange's context) — people often start answering right at the 2s edge.
+PASSIVE_FOLLOWUP_LATE_SECS = float(os.environ.get("NULVOICEAGENT_PASSIVE_FOLLOWUP_LATE_SECS", "1.5"))
+# A follow-up capture that transcribes to NOTHING (a laugh, "mmm", a lone "uh"
+# cut off by the trail) re-opens the window instead of ending the exchange, up to
+# this many times per exchange. The last few follow-up wavs are kept in
+# PASSIVE_DEBUG_DIR so a missed reply can be listened to.
+# Gate for follow-up windows only. A reply to her is often said more quietly
+# than talking to chat: 2026-10-06 a whole question peaked at -26.4 dB, never
+# crossed the normal -20 dB gate, and only its loud last words got captured just
+# after the window closed. Room floor measured ~-38 dB, so -30 opens on quiet
+# conversational speech without opening on noise. Close sits below open
+# (hysteresis).
+PASSIVE_FOLLOWUP_GATE_OPEN_DB = float(os.environ.get("NULVOICEAGENT_PASSIVE_FOLLOWUP_GATE_OPEN_DB", "-30"))
+PASSIVE_FOLLOWUP_GATE_CLOSE_DB = float(os.environ.get("NULVOICEAGENT_PASSIVE_FOLLOWUP_GATE_CLOSE_DB", "-35"))
+PASSIVE_FOLLOWUP_BLIP_RETRIES = int(os.environ.get("NULVOICEAGENT_PASSIVE_FOLLOWUP_BLIP_RETRIES", "2"))
+PASSIVE_DEBUG_DIR = CACHE_DIR / "passive-debug"
+PASSIVE_DEBUG_KEEP = int(os.environ.get("NULVOICEAGENT_PASSIVE_DEBUG_KEEP", "12"))
 PASSIVE_MIN_WORDS = int(os.environ.get("NULVOICEAGENT_PASSIVE_MIN_WORDS", "5"))
 # Seconds each capture cycle waits for speech onset before recycling parec.
 PASSIVE_ONSET_WAIT = float(os.environ.get("NULVOICEAGENT_PASSIVE_ONSET_WAIT", "30.0"))
