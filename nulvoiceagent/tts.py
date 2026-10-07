@@ -13,7 +13,7 @@ import time
 import urllib.request
 import wave
 
-from . import config, state, visemes
+from . import caption, config, state, visemes
 
 # Seconds the last speak() spent on synth (kokoromodel POST + optional harmony
 # layer), i.e. the latency before any sound — NOT the playback duration. The CLI
@@ -24,6 +24,9 @@ last_synth_secs = 0.0
 # {ph,start,end}. Empty when the backend returns no alignment (onnx). Read by speak()
 # to build a viseme track for lip-sync.
 _last_align: list[dict] = []
+# Per-word timing from the last synth (torch backend only): list of {t,ws,s,e}.
+# Read by speak() to publish a word-timed caption (caption.py).
+_last_words: list[dict] = []
 
 
 def synth(text: str, voice: str | None = None, pitch: str | None = None,
@@ -44,17 +47,23 @@ def synth(text: str, voice: str | None = None, pitch: str | None = None,
         config.KOKORO_URL, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
-    global _last_align
-    _last_align = []
+    global _last_align, _last_words
+    _last_align, _last_words = [], []
     with urllib.request.urlopen(req, timeout=60) as resp:
         wav = resp.read()
         hdr = resp.headers.get("X-Kokoro-Align")   # per-phoneme timing (torch backend)
+        whdr = resp.headers.get("X-Kokoro-Words")  # per-word timing (torch backend)
+    import base64
     if hdr:
         try:
-            import base64
             _last_align = json.loads(base64.b64decode(hdr))
         except (ValueError, TypeError):
             _last_align = []
+    if whdr:
+        try:
+            _last_words = json.loads(base64.b64decode(whdr))
+        except (ValueError, TypeError):
+            _last_words = []
     if config.LAYER_PITCH:
         try:
             wav = _layer(wav, float(config.LAYER_PITCH), float(config.LAYER_GAIN or "0.7"))
@@ -231,9 +240,11 @@ def speak(text: str, voice: str | None = None, pitch: str | None = None,
         driver = threading.Thread(target=_drive_mouth,
                                   args=(env, hop, dur, until, stop, track), daemon=True)
         driver.start()
+    cid = caption.show(text, _last_words, dur)
     try:
         play(wav)
     finally:
+        caption.clear(cid)
         stop.set()
         if driver is not None:
             driver.join(timeout=0.3)

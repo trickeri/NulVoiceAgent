@@ -41,6 +41,14 @@ _PHRASES = {
         "{who}'s done with the task.",
         "{who} wrapped up the task.",
         "{who} completed the task.",
+        "{who} finished its work.",
+        "{who} wrapped things up.",
+        "{who} is ready for you.",
+        "{who} got it done.",
+        "{who} finished the changes.",
+        "{who} is finished.",
+        "{who} made the changes.",
+        "{who} is all set.",
     ],
     "plan": [
         "{who}'s plan is ready.",
@@ -54,11 +62,22 @@ _PHRASES = {
         "{who}'s done with the fix.",
         "{who} finished the fix.",
     ],
+    # The no-edit catch-all: a real investigation OR a plain "do X" that only ran
+    # commands, so neutral "completed its task" lines share the pool.
     "investigation": [
         "{who} finished investigating.",
         "{who} wrapped up the investigation.",
-        # _pick_phrase() flips "digging into it" <-> "looking into it" 50/50.
         "{who} finished digging into it.",
+        "{who} finished looking into it.",
+        "{who} is done looking into it.",
+        "{who} got to the bottom of it.",
+        "{who} finished checking it out.",
+        "{who} has some findings for you.",
+        "{who} is done poking around.",
+        "{who} completed its task.",
+        "{who} is all done.",
+        "{who} finished up.",
+        "{who} took care of it.",
     ],
     # the user asked a question and the agent answered it (no edits, not asking back).
     "answer": [
@@ -427,12 +446,8 @@ def _is_user_question(user_text: str) -> bool:
 
 
 def _pick_phrase(kind: str) -> str:
-    """Choose a confirmation for `kind`. For investigation, the 'digging into it'
-    phrasing is a 50/50 coin flip with the synonym 'looking into it'."""
-    phrase = random.choice(_PHRASES[kind])
-    if "digging into it" in phrase and random.random() < 0.5:
-        phrase = phrase.replace("digging into it", "looking into it")
-    return phrase
+    """Choose a confirmation for `kind`."""
+    return random.choice(_PHRASES[kind])
 
 
 def _classify(user_text: str, asst_text: str, tools: set[str]) -> str:
