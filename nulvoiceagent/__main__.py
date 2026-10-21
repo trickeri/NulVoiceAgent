@@ -235,7 +235,9 @@ def _handle_chat(text: str, reset: bool = False) -> None:
     # Hermes, which has no idea what to summarize. "Summarize Krita Claude" picks
     # that agent's completion; bare "summarize" = the latest. Falls through to
     # chat if nothing fresh is stashed (so "summarize this article" still works).
-    if done.wants_summary_request(text):
+    # A clip command whose TITLE contains "summary" ("clip that title ion two
+    # summary") is still a clip — don't let the summarizer swallow it.
+    if done.wants_summary_request(text) and not intents.looks_like_clip(text):
         summary = done.make_summary(text)
         if summary:
             _log(f"agent: {summary}")

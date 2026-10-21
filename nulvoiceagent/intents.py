@@ -552,6 +552,42 @@ def try_sf_focus_app(text: str) -> Optional[Intent]:
     return Intent(f"Focusing {needle}.", ["sf-focus-app", needle])
 
 
+# "save workspace" / "save as workspace two" / "load workspace" / "restore workspace 3"
+# -> sf-workspace save|load [name] (SystemFlow checkpoint of every open window: monitor,
+# Z-layer, tile). No number = the "default" workspace. The WHOLE utterance must be the
+# command (fillers allowed) — "load workspace" never fires from inside a sentence.
+_RE_SF_WORKSPACE = re.compile(
+    r"^(?:(?:hey|ok|okay|please|can you|could you|would you)\s+)*"
+    r"(?P<verb>save|load|restore)\s+"
+    r"(?:(?:as|the|my|this|our|current|a)\s+)*"
+    r"(?P<default>default\s+)?"
+    r"work\s?space"
+    r"(?:\s+(?:as\s+)?(?:number\s+)?(?P<num>\w+))?$")
+# ASR spells spoken numbers as homophones ("load workspace to"); "default" names it outright.
+_WORKSPACE_NUM = {"one": "1", "won": "1", "two": "2", "to": "2", "too": "2", "three": "3",
+                  "four": "4", "for": "4", "five": "5", "six": "6", "seven": "7",
+                  "eight": "8", "nine": "9", "ten": "10", "default": "default"}
+
+
+def try_sf_workspace(text: str) -> Optional[Intent]:
+    m = _RE_SF_WORKSPACE.match(re.sub(r"\s+please$", "", _norm(text)))
+    if not m:
+        return None
+    num = m.group("num")
+    if num is None:
+        name = "default"
+    elif num.isdigit():
+        name = str(int(num))
+    else:
+        name = _WORKSPACE_NUM.get(num)
+        if name is None:              # "save workspace layout" etc. — not a numbered workspace
+            return None
+    op = "save" if m.group("verb") == "save" else "load"
+    label = "the default workspace" if name == "default" else f"workspace {name}"
+    say = f"Saving {label}." if op == "save" else f"Loading {label}."
+    return Intent(say, ["sf-workspace", op, name])
+
+
 # --- OBS clip: "clip that" -> save the replay buffer + speak confirmation ----- #
 # The MONEY intent: a missed "clip" = a lost highlight. Kept deterministic (no
 # LLM) so it's instant and never gets talked-about-instead-of-done by the chat
@@ -581,6 +617,15 @@ _CLIP_FILLER = {
 _RE_CLIP_TITLE = re.compile(
     r"\b(?:title[ds]?|call(?:ed)?(?:\s+it|\s+this|\s+that)?|name[ds]?(?:\s+it|\s+this|\s+that)?)\b",
     re.IGNORECASE)
+
+
+def looks_like_clip(text: str) -> bool:
+    """Pure check (no OBS call): does `text` open with a clip trigger? Lets the
+    done-summarizer stand aside for "clip that title ion two summary"."""
+    raw = (text or "").strip()
+    tm = _RE_CLIP_TITLE.search(raw)
+    body = raw[:tm.start()] if tm else raw
+    return bool(_RE_CLIP_HEAD.match(_norm(body)))
 
 
 def try_clip(text: str) -> Optional[Intent]:
@@ -931,6 +976,7 @@ _PARSERS: list[Parser] = [
     try_obs_camera_bg,
     try_obs_scene,
     try_obs_overlay,
+    try_sf_workspace,
     try_sf_monitor,
     try_sf_layer_named,
     try_sf_layer,
