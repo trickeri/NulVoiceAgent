@@ -64,7 +64,8 @@ def _foreign_turn_active() -> bool:
 
 
 def write(state: str, until: float | None = None, mouth: float | None = None,
-          level: float | None = None, viseme: str | None = None) -> None:
+          level: float | None = None, viseme: str | None = None,
+          tag: str | None = None) -> None:
     # Defer to a live interactive turn: a background announcement never overwrites
     # the indicator while the user is recording / their turn is being processed.
     if _foreign_turn_active():
@@ -78,6 +79,8 @@ def write(state: str, until: float | None = None, mouth: float | None = None,
         obj["level"] = level
     if viseme is not None:
         obj["viseme"] = viseme
+    if tag is not None:
+        obj["tag"] = tag     # who/why, for readers that need it (e.g. passive follow-up)
     try:
         config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(config.CACHE_DIR), prefix=".state.")

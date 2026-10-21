@@ -91,6 +91,26 @@ def _voice_turn_live() -> bool:
     return False
 
 
+# state.json tag for the follow-up window's "thinking" glow, so _avatar_state()
+# doesn't mistake our own indicator for a hotkey turn.
+_FOLLOWUP_TAG = "followup"
+
+
+def _followup_glow(on: bool) -> None:
+    """Show (thinking glow) / clear the follow-up window indicator. Clearing only
+    touches state.json if it's still our glow, so a turn that took over keeps its
+    own state."""
+    if on:
+        state.write("thinking", tag=_FOLLOWUP_TAG)
+        return
+    try:
+        o = json.loads((config.CACHE_DIR / "state.json").read_text())
+    except (OSError, ValueError):
+        return
+    if o.get("tag") == _FOLLOWUP_TAG:
+        state.idle()
+
+
 def _avatar_state() -> str:
     """Current published state (idle/listening/thinking/talking), with the same
     60s stale-guard the taskbar face uses — a crashed writer mustn't wedge
@@ -102,6 +122,8 @@ def _avatar_state() -> str:
     s = str(o.get("state", "idle"))
     if s != "idle" and time.time() - float(o.get("ts", 0)) > 60:
         return "idle"
+    if o.get("tag") == _FOLLOWUP_TAG:
+        return "idle"            # our own follow-up window glow, not a hotkey turn
     return s
 
 
@@ -331,6 +353,13 @@ def _followup(watch: _BusyWatch, history: list) -> None:
     or PASSIVE_FOLLOWUP_MAX_TURNS replies. No dice / word minimum here — "yeah,
     right?" is a perfectly good answer to her. `history` (the exchange so far,
     (speaker, line) pairs) is sent with every reply and grown as it goes."""
+    try:
+        _followup_loop(watch, history)
+    finally:
+        _followup_glow(False)
+
+
+def _followup_loop(watch: _BusyWatch, history: list) -> None:
     global _late_reply, _blips_left
     window = config.PASSIVE_FOLLOWUP_SECS
     while True:
@@ -346,6 +375,7 @@ def _followup(watch: _BusyWatch, history: list) -> None:
             return
         mark = time.monotonic()
         info: dict = {}
+        _followup_glow(True)          # window open: thinking glow until it closes
         wav = stt.record(max_secs=window + config.PASSIVE_MAX_SECS,
                          onset_timeout=window,
                          trail_silence=config.PASSIVE_TRAIL, info=info,

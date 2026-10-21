@@ -253,11 +253,12 @@ PASSIVE_TRAIL = float(os.environ.get("NULVOICEAGENT_PASSIVE_TRAIL", "1.2"))
 # seconds for Trickery to start replying; if he does, she answers (still chat-only)
 # and the window re-opens after each answer, up to PASSIVE_FOLLOWUP_MAX_TURNS
 # replies. 0 disables. The cooldown is re-stamped when the exchange ends.
-PASSIVE_FOLLOWUP_SECS = float(os.environ.get("NULVOICEAGENT_PASSIVE_FOLLOWUP_SECS", "2.0"))
+# While the window is open the avatar shows the thinking glow (state tag "followup").
+PASSIVE_FOLLOWUP_SECS = float(os.environ.get("NULVOICEAGENT_PASSIVE_FOLLOWUP_SECS", "10.0"))
 PASSIVE_FOLLOWUP_MAX_TURNS = int(os.environ.get("NULVOICEAGENT_PASSIVE_FOLLOWUP_MAX_TURNS", "6"))
 # Late-reply grace: if the NEXT utterance after a closed follow-up window starts
 # within this many seconds of the close, it's still taken as a reply to her (with
-# the exchange's context) — people often start answering right at the 2s edge.
+# the exchange's context) — people often start answering right at the window's edge.
 PASSIVE_FOLLOWUP_LATE_SECS = float(os.environ.get("NULVOICEAGENT_PASSIVE_FOLLOWUP_LATE_SECS", "1.5"))
 # A follow-up capture that transcribes to NOTHING (a laugh, "mmm", a lone "uh"
 # cut off by the trail) re-opens the window instead of ending the exchange, up to
