@@ -3,7 +3,7 @@
 The pieces this orchestrator wires together (all run locally on this box):
   - NulSpeech2Text STT  :48450  (POST /inference, multipart wav)
   - kokoromodel    TTS  :48490  (POST /speak -> audio/wav)
-  - the "brain": Hermes (default chat), codex or claude CLIs, all headless.
+  - the "brain": Codex (default), Hermes or Claude CLIs, all headless.
 
 Every value below can be overridden with a NULVOICEAGENT_* environment variable.
 The things that make the agent *yours* — its voice and its personality — live in
@@ -35,14 +35,12 @@ KOKORO_URL = os.environ.get("NULVOICEAGENT_KOKORO_URL", "http://127.0.0.1:48490/
 
 # --- brain selection ---------------------------------------------------------
 # Two independent brains:
-#   CHAT_BRAIN — conversation / "explore ideas". Default "hermes": the Hermes
-#     agent (running on a provider of your choice) so you get its persistent
-#     memory + skills, including handing tasks off to named tmux panes.
-#     Alternatives: "codex" (thin codex exec) | "claude".
+#   CHAT_BRAIN — conversation / "explore ideas". Default "codex": read-only
+#     codex exec. Alternatives: "hermes" (persistent memory) | "claude".
 #   CMD_BRAIN  — command-mode classifier. Default "codex": a strict schema-
 #     constrained classifier that only ever picks an allowlisted action name.
 #     ("hermes" isn't used here — command mode must stay deterministic.)
-CHAT_BRAIN = os.environ.get("NULVOICEAGENT_CHAT_BRAIN", "hermes").strip().lower()
+CHAT_BRAIN = os.environ.get("NULVOICEAGENT_CHAT_BRAIN", "codex").strip().lower()
 CMD_BRAIN = os.environ.get("NULVOICEAGENT_CMD_BRAIN", "codex").strip().lower()
 # Fallback brain when the primary is out of tokens / over its usage limit for the
 # session (or otherwise can't answer). Default "claude" — headless `claude -p`, a
@@ -87,6 +85,7 @@ HERMES_USER_FILE = HERMES_DIR / "memories" / "USER.md"
 DISTILL_WATERMARK = CACHE_DIR / "distill-watermark"  # last distilled message id
 DISTILL_BACKUP_DIR = CACHE_DIR / "distill-backups"
 DISTILL_DIFF_FILE = CACHE_DIR / "distill-last.diff"  # what the last run changed
+# Claude fallback model; the first attempt uses the Codex CLI's default model.
 DISTILL_MODEL = os.environ.get("NULVOICEAGENT_DISTILL_MODEL", "claude-sonnet-5").strip()
 # Don't bother running for a handful of new messages.
 DISTILL_MIN_MESSAGES = int(os.environ.get("NULVOICEAGENT_DISTILL_MIN_MESSAGES", "10"))
@@ -186,6 +185,14 @@ try:
     CAPTION_DELAY = float(os.environ.get("NULVOICEAGENT_CAPTION_DELAY", _PROFILE.get("CAPTION_DELAY", "0.08")))
 except ValueError:
     CAPTION_DELAY = 0.08
+# Who's talking, shown as the caption's speaker ("Aurinex:" atop the speech bubble).
+# Profile NAME=, else the active profile's name, title-cased.
+try:
+    _ACTIVE_NAME = (CONFIG_DIR / "active").read_text(encoding="utf-8").strip()
+except OSError:
+    _ACTIVE_NAME = ""
+AGENT_NAME = os.environ.get("NULVOICEAGENT_AGENT_NAME",
+                            _PROFILE.get("NAME", _ACTIVE_NAME.title())).strip()
 
 # --- "agent is done" announcer (Claude/Codex Stop hooks) ---------------------
 # Speak a short confirmation when a Claude Code or Codex turn finishes, then
@@ -195,7 +202,7 @@ DONE_ENABLE = os.environ.get("NULVOICEAGENT_DONE_ENABLE", "1").strip() not in ("
 # How long to wait for you to start saying "summarize" after the confirmation
 # (the noise-gate onset timeout for that follow-up listen).
 DONE_LISTEN_SECS = float(os.environ.get("NULVOICEAGENT_DONE_LISTEN_SECS", "5.0"))
-# Model for the on-demand summary (headless `claude -p`). Fast/cheap by default.
+# Claude fallback model for summaries; Codex CLI is always attempted first.
 DONE_SUMMARY_MODEL = os.environ.get("NULVOICEAGENT_DONE_SUMMARY_MODEL", "claude-haiku-4-5").strip()
 # How long an announced completion stays summarizable. Completions are kept per
 # agent name, so with several Claudes running the one you ask about may have
@@ -344,8 +351,8 @@ VIEWER_TTS_ENABLE = os.environ.get("NULVOICEAGENT_VIEWER_TTS", "1").strip() not 
 # is a fresh process that checks this at speak time. Absent (default) = enabled.
 VIEWER_TTS_OFF_FLAG = CACHE_DIR / "viewer-tts-off"
 # Hard cap on spoken characters (post-filter, pre-attribution). Twitch cheer/redeem
-# messages can be long; keep the read short.
-VIEWER_TTS_MAX_CHARS = int(os.environ.get("NULVOICEAGENT_VIEWER_TTS_MAX_CHARS", "200"))
+# messages can be long; this only guards against runaway walls of text.
+VIEWER_TTS_MAX_CHARS = int(os.environ.get("NULVOICEAGENT_VIEWER_TTS_MAX_CHARS", "1000"))
 # Blocklist: one word/phrase per line (`#` comments). A case-insensitive substring
 # match on ANY line drops the whole message (we never half-speak a censored line).
 VIEWER_TTS_BLOCKLIST = Path(os.environ.get(

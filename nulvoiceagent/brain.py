@@ -318,7 +318,7 @@ _PROVIDER_NOTICE_RE = re.compile(
     r"claude\.ai/settings|chatgpt\.com/(?:codex|explore)|cc_cli_limit|"
     r"you've hit your (?:monthly|weekly|daily|usage|spend)",
     re.IGNORECASE)
-_OUT_OF_BUDGET_LINE = "Both my brains are out of tokens right now, Trickery."
+_OUT_OF_BUDGET_LINE = "Claude has hit its usage limit, Trickery."
 
 
 def _scrub_provider_notice(reply: str) -> str:
@@ -460,7 +460,7 @@ def _chat_dispatch(text: str, reset: bool) -> str:
     parked = primary in _read_cooldowns()   # expired entry = this turn is a probe
     try:
         out = backend(text, reset)
-    except BrainUnavailable as e:
+    except (BrainUnavailable, OSError, subprocess.SubprocessError) as e:
         if not usable_fb:
             raise
         _note_cooldown_start(primary, _start_cooldown(primary, e))
@@ -564,6 +564,16 @@ def _action_hint(names: list[str]) -> str:
     )
 
 
+def _command_skill_hint() -> str:
+    """Load voice routing guidance even when CLI skill discovery is unavailable."""
+    path = config.REPO_DIR / "skills" / "nulvoice-commands" / "SKILL.md"
+    try:
+        body = path.read_text(encoding="utf-8").split("---", 2)[-1].strip()
+    except OSError:
+        return ""
+    return "\n\n[SYSTEM] Voice command skill:\n" + body
+
+
 def _style_hint() -> str:
     """Tell her which of her own signature images are currently worn out, measured
     from what she actually said (see nulvoiceagent.ledger). Deliberately cheap — a
@@ -588,7 +598,7 @@ def _ask_hint(panes: list[str]) -> str:
         "built-in action for (e.g. a missing app/CLI command or feature) and a "
         "relevant builder pane is open (e.g. 'Hermes Claude' or 'Programming "
         "Claude'), append a FINAL line exactly like "
-        "[[ask: <pane name> | <a clear request to implement it>]] using one pane "
+        "[[ask: <pane name> | <a clear request to perform the operation>]] using one pane "
         "name verbatim from that list. The request is delivered for you — keep "
         "your spoken reply a short confirmation. Don't use [[ask:]] for ordinary chat."
     )
@@ -623,7 +633,8 @@ def chat_act(text: str, names: list[str],
     model only ever names a target, it never reaches one itself. Returns
     (spoken_reply, action_name_or_None, (pane, message)_or_None)."""
     panes = list(dispatch.load().keys())
-    prompt = text + _action_hint(names) + _ask_hint(panes) + _style_hint()
+    prompt = (text + _command_skill_hint() + _action_hint(names)
+              + _ask_hint(panes) + _style_hint())
     reply = _chat_dispatch(prompt, reset)
 
     action = None
@@ -659,7 +670,7 @@ def classify(text: str, names: list[str]) -> dict:
     parked = primary in _read_cooldowns()
     try:
         out = backend(text, names)
-    except BrainUnavailable as e:
+    except (BrainUnavailable, OSError, subprocess.SubprocessError) as e:
         # Out of Codex tokens -> classify on the fallback brain (claude) so command
         # mode keeps working. classify is stateless, so no session to preserve.
         if not usable_fb:
@@ -673,10 +684,50 @@ def classify(text: str, names: list[str]) -> dict:
     return out
 
 
+def complete(instruction: str, system_prompt: str, claude_model: str = "") -> str:
+    """Stateless text processing: Codex first, then Claude on failure.
+
+    Keep this separate from chat sessions and the spoken persona: memory output
+    can be markdown, and summaries must not inherit earlier conversation.
+    """
+    with tempfile.TemporaryDirectory(prefix="nulvoiceagent-") as directory:
+        out_path = os.path.join(directory, "reply.txt")
+        cmd = ["codex", "exec", "-s", "read-only", "--skip-git-repo-check",
+               "--color", "never", "-C", directory, "-o", out_path]
+        cmd += _reasoning_args(config.CHAT_REASONING)
+        try:
+            proc = subprocess.run(
+                cmd + [system_prompt + "\n\n" + instruction],
+                capture_output=True, text=True, timeout=180)
+            if proc.returncode != 0:
+                _check_available("codex", proc)
+            reply = _read_out(out_path, proc)
+            if not reply or _PROVIDER_NOTICE_RE.search(reply[:200]):
+                raise BrainUnavailable("codex returned no usable answer")
+            return reply
+        except (BrainUnavailable, OSError, subprocess.SubprocessError) as error:
+            _note_fallback("codex", "claude", error)
+    cmd = ["claude", "-p", instruction, "--output-format", "json",
+           "--append-system-prompt", system_prompt,
+           "--disallowed-tools", "Write,Edit,NotebookEdit,Bash,Read,Grep,Glob"]
+    if claude_model:
+        cmd += ["--model", claude_model]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0:
+        raise BrainUnavailable(f"claude failed ({proc.returncode})")
+    try:
+        reply = (json.loads(proc.stdout).get("result") or "").strip()
+    except (json.JSONDecodeError, AttributeError):
+        reply = proc.stdout.strip()
+    if not reply or _PROVIDER_NOTICE_RE.search(reply[:200]):
+        raise BrainUnavailable("claude returned no usable answer")
+    return reply
+
+
 def summarize(text: str) -> str:
     """Compress a Claude Code assistant message into a SPOKEN 2-3 sentence summary
     for the user (who didn't read it), leading with anything Claude is waiting on
-    from him and any gotchas. Headless `claude -p`, read-only, fast model."""
+    from him and any gotchas. Codex first, Claude fallback, read-only."""
     text = (text or "").strip()
     if not text:
         return ""
@@ -700,22 +751,12 @@ def summarize(text: str) -> str:
         "preamble. Reply with ONLY the summary.\n\n"
         f"<message>\n{text}\n</message>"
     )
-    cmd = ["claude", "-p", instruction, "--output-format", "json",
-           "--append-system-prompt", sys_prompt,
-           "--disallowed-tools", "Write,Edit,NotebookEdit,Bash,Read,Grep,Glob"]
-    if config.DONE_SUMMARY_MODEL:
-        cmd += ["--model", config.DONE_SUMMARY_MODEL]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    try:
-        d = json.loads(proc.stdout)
-        return (d.get("result") or "").strip()
-    except (json.JSONDecodeError, AttributeError):
-        return proc.stdout.strip()
+    return complete(instruction, sys_prompt, config.DONE_SUMMARY_MODEL)
 
 
 def condense(text: str, focus: str = "") -> str:
     """Retell page/article CONTENT as short spoken prose — the "narrate a summary
-    of this" path. Same headless read-only `claude -p` mechanics as summarize(),
+    of this" path. Same Codex-first read-only mechanics as summarize(),
     but for arbitrary page text rather than a Claude Code completion.
 
     The wrapping matters for the same reason it does in summarize(): a page often
@@ -741,17 +782,7 @@ def condense(text: str, focus: str = "") -> str:
         "Reply with ONLY the digest.\n\n"
         f"<page>\n{text}\n</page>"
     )
-    cmd = ["claude", "-p", instruction, "--output-format", "json",
-           "--append-system-prompt", sys_prompt,
-           "--disallowed-tools", "Write,Edit,NotebookEdit,Bash,Read,Grep,Glob"]
-    if config.DONE_SUMMARY_MODEL:
-        cmd += ["--model", config.DONE_SUMMARY_MODEL]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    except (OSError, subprocess.SubprocessError):
+        return complete(instruction, sys_prompt, config.DONE_SUMMARY_MODEL)
+    except (BrainUnavailable, OSError, subprocess.SubprocessError):
         return ""
-    try:
-        d = json.loads(proc.stdout)
-        return (d.get("result") or "").strip()
-    except (json.JSONDecodeError, AttributeError):
-        return proc.stdout.strip()

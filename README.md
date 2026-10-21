@@ -17,10 +17,9 @@ mic ─parec─▶ NulSpeech2Text (STT :48450) ─▶ BRAIN ─▶ kokoromodel (
 - **TTS** — a **Kokoro** server (`kokoromodel`) on `:48490` (`POST /speak` with
   `{"text","voice","speed","pitch"}` → `audio/wav`). Ships pointed at a **stock
   Kokoro voice** (`af_heart`); pick any voice in a profile.
-- **Brain** — pluggable, **no local LLM**. Default chat brain is the
-  [Hermes agent](https://github.com/NousResearch/hermes-agent) (persistent memory +
-  skills, and it can hand tasks off to named terminal panes). `codex` and `claude`
-  CLIs also work as brains and as fallbacks.
+- **Brain** — pluggable, **no local LLM**. Default brain is **Codex CLI**, with **Claude CLI** as fallback.
+  Chat, command classification, summaries, and memory processing try Codex first.
+  Hermes is an optional chat backend.
 
 It ships **neutral**: a stock voice and a plain, read-only persona. You make it
 yours with a **persona file** and **voice profiles** (below) — none of which live
@@ -62,14 +61,14 @@ curl -fsS -X POST http://127.0.0.1:48490/speak -H 'content-type: application/jso
 *"Which brain should the conversational side use — Hermes (memory + can route to
 panes), Codex, or Claude?"*
 
-- **Hermes** *(default, recommended)* — the [Hermes agent](https://github.com/NousResearch/hermes-agent).
+- **Hermes** *(optional)* — the [Hermes agent](https://github.com/NousResearch/hermes-agent).
   Persistent memory + skills, and it's the brain that can hand a task to a named
   tmux pane. Needs one-time setup (step 4).
-- **Codex** — thin `codex exec`, read-only. Reads the persona from `AGENTS.md`.
+- **Codex** *(default)* — thin `codex exec`, read-only. Reads the persona from `AGENTS.md`.
 - **Claude** — headless `claude -p`, read-only. Gets the persona as a system prompt.
 
 Whatever they pick, also make sure **`claude`** is installed if possible — it's the
-default *fallback* brain (used when the primary is out of tokens) and powers the
+default *fallback* brain (used when the primary is out of tokens) and backs up the
 optional completion-summary feature. Set the choice with `NULVOICEAGENT_CHAT_BRAIN`.
 
 ### 3. Clone + put the launcher on PATH
@@ -240,7 +239,7 @@ Everything is env-overridable (`NULVOICEAGENT_*`). Common ones:
 |---|---|---|
 | `NULVOICEAGENT_STT_URL` | `http://127.0.0.1:48450/inference` | NulSpeech2Text endpoint |
 | `NULVOICEAGENT_KOKORO_URL` | `http://127.0.0.1:48490/speak` | Kokoro TTS endpoint |
-| `NULVOICEAGENT_CHAT_BRAIN` | `hermes` | `hermes` \| `codex` \| `claude` |
+| `NULVOICEAGENT_CHAT_BRAIN` | `codex` | `hermes` \| `codex` \| `claude` |
 | `NULVOICEAGENT_CMD_BRAIN` | `codex` | classifier brain (`codex` \| `claude`) |
 | `NULVOICEAGENT_CHAT_FALLBACK` / `_CMD_FALLBACK` | `claude` | brain to retry on when the primary is out of tokens |
 | `NULVOICEAGENT_VOICE` / `_SPEED` / `_PITCH` | profile | override the active voice profile |

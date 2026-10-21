@@ -22,14 +22,12 @@ Any validation failure aborts and leaves the existing file untouched.
 """
 from __future__ import annotations
 import difflib
-import json
 import re
 import sqlite3
-import subprocess
 import time
 from pathlib import Path
 
-from . import config
+from . import brain, config
 
 
 # voiceagent appends an action-list hint to every user message before sending it
@@ -146,19 +144,7 @@ def _instruction(current: str, transcript: str, budget: int) -> str:
 
 
 def _ask_model(instruction: str) -> str:
-    cmd = ["claude", "-p", instruction, "--output-format", "json",
-           "--append-system-prompt", _SYS_PROMPT,
-           "--disallowed-tools", "Write,Edit,NotebookEdit,Bash,Read,Grep,Glob"]
-    if config.DISTILL_MODEL:
-        cmd += ["--model", config.DISTILL_MODEL]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"distill model failed ({proc.returncode}): "
-                           f"{(proc.stderr or '').strip()[-200:]}")
-    try:
-        out = (json.loads(proc.stdout).get("result") or "").strip()
-    except (json.JSONDecodeError, AttributeError):
-        out = proc.stdout.strip()
+    out = brain.complete(instruction, _SYS_PROMPT, config.DISTILL_MODEL)
     # Models like to wrap a whole-file answer in a fence even when told not to.
     m = re.match(r"^```(?:markdown|md)?\s*\n(.*)\n```\s*$", out, re.DOTALL)
     return (m.group(1) if m else out).strip()

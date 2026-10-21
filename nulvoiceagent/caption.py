@@ -4,9 +4,11 @@ the voice. Like state.json, nothing in the framework needs a reader.
 
 caption.json, written once per speak() just before playback starts:
     {"id": "<pid>-<ms>", "start": <epoch audio starts>, "until": <epoch it ends>,
+     "speaker": "Aurinex",
      "sentences": [{"s": sec, "e": sec,
                     "words": [{"t": "there,", "ws": " ", "s": sec, "e": sec}, ...]}]}
-Times are seconds from `start`. Joining t+ws over a sentence's words gives its
+`speaker` is who's talking (config.AGENT_NAME unless the caller names someone
+else, e.g. a viewer's TTS); omitted when blank. Times are seconds from `start`. Joining t+ws over a sentence's words gives its
 text. Punctuation rides on the word before it. When playback ends it's rewritten
 as {"id": ..., "active": false} (only if it's still ours, so an overlapping
 speaker isn't blanked).
@@ -106,7 +108,8 @@ def _write(obj: dict) -> None:
         pass
 
 
-def show(text: str, words: list[dict] | None, dur: float) -> str | None:
+def show(text: str, words: list[dict] | None, dur: float,
+         speaker: str | None = None) -> str | None:
     """Publish the caption for audio starting now; returns its id (for clear())."""
     if not config.CAPTION:
         return None
@@ -115,8 +118,11 @@ def show(text: str, words: list[dict] | None, dur: float) -> str | None:
         return None
     start = time.time() + config.CAPTION_DELAY
     cid = f"{os.getpid()}-{int(start * 1000)}"
-    _write({"id": cid, "start": start, "until": start + dur + 0.3,
-            "sentences": sentences})
+    obj = {"id": cid, "start": start, "until": start + dur + 0.3, "sentences": sentences}
+    speaker = (speaker if speaker is not None else config.AGENT_NAME).strip()
+    if speaker:
+        obj["speaker"] = speaker
+    _write(obj)
     return cid
 
 

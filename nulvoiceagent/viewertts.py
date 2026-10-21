@@ -136,9 +136,15 @@ def say(user: str, text: str, source: str = "bits", bits: int | None = None) -> 
         deadline = time.monotonic() + config.VIEWER_TTS_WAIT_TURN_SECS
         while _turn_active() and time.monotonic() < deadline:
             time.sleep(0.3)
-        tts.speak(
-            spoken,
-            voice=config.VIEWER_TTS_VOICE or None,
-            pitch=config.VIEWER_TTS_PITCH or None,
-            speed=config.VIEWER_TTS_SPEED or None,
-        )
+        # The hub spawns us with stdio ignored, so an uncaught error here vanished
+        # silently (the viewer just never heard their redeem). Log it instead.
+        try:
+            tts.speak(
+                spoken,
+                voice=config.VIEWER_TTS_VOICE or None,
+                pitch=config.VIEWER_TTS_PITCH or None,
+                speed=config.VIEWER_TTS_SPEED or None,
+                speaker=name,
+            )
+        except Exception as e:  # noqa: BLE001
+            _log(f"viewer-tts: FAILED {name!r}: {type(e).__name__}: {e}")

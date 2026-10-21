@@ -1,6 +1,7 @@
 """Text-to-speech out — POST to kokoromodel, play the WAV through PipeWire."""
 from __future__ import annotations
 import array
+import http.client
 import io
 import json
 import math
@@ -28,6 +29,12 @@ _last_align: list[dict] = []
 # Read by speak() to publish a word-timed caption (caption.py).
 _last_words: list[dict] = []
 
+# kokoromodel ships per-phoneme/per-word timing as base64 JSON response headers. On
+# a long message (a 1000-char viewer redeem) those headers blow past http.client's
+# 64 KiB line limit and urlopen raises "got more than 65536 bytes when reading
+# header line" — the speech was synthesized but never played. Lift the cap.
+http.client._MAXLINE = max(getattr(http.client, "_MAXLINE", 65536), 16 * 1024 * 1024)
+
 
 def synth(text: str, voice: str | None = None, pitch: str | None = None,
           speed: str | None = None) -> bytes:
@@ -49,7 +56,11 @@ def synth(text: str, voice: str | None = None, pitch: str | None = None,
     )
     global _last_align, _last_words
     _last_align, _last_words = [], []
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    # Synth time scales with text length, and under stream load (OBS + game on the
+    # GPU) a 1000-char wall can take well over a minute; a fixed 60s timeout dropped
+    # those mid-synth. Floor 60s, plus ~0.25s per character.
+    timeout = max(60.0, 60.0 + 0.25 * len(text))
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         wav = resp.read()
         hdr = resp.headers.get("X-Kokoro-Align")   # per-phoneme timing (torch backend)
         whdr = resp.headers.get("X-Kokoro-Words")  # per-word timing (torch backend)
@@ -216,7 +227,8 @@ def _drive_mouth(env: list[float], hop: float, dur: float, until: float,
 
 
 def speak(text: str, voice: str | None = None, pitch: str | None = None,
-          speed: str | None = None) -> None:
+          speed: str | None = None, speaker: str | None = None) -> None:
+    """`speaker` labels the caption (default: config.AGENT_NAME)."""
     global last_synth_secs
     text = (text or "").strip()
     if not text:
@@ -240,7 +252,7 @@ def speak(text: str, voice: str | None = None, pitch: str | None = None,
         driver = threading.Thread(target=_drive_mouth,
                                   args=(env, hop, dur, until, stop, track), daemon=True)
         driver.start()
-    cid = caption.show(text, _last_words, dur)
+    cid = caption.show(text, _last_words, dur, speaker)
     try:
         play(wav)
     finally:
