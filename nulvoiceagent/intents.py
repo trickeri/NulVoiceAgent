@@ -960,6 +960,56 @@ def try_narration_control(text: str) -> Optional[Intent]:
     return None
 
 
+# --- NulVP (the VTuber app): recenter = its F9 --------------------------------- #
+# "calibrate vtuber" re-adopts where Trickery sits on the webcam (and his head on
+# the phone) as neutral. F9 does that too but needs NulVP's window focused; on
+# stream it's hidden, so this goes in over NulVP's loopback control port (the
+# same one the Launchpad's camera buttons use), as the line "recenter".
+# Fires only on a short utterance with BOTH a calibrate/recenter word and a
+# vtuber word, nothing else but filler — so chat about "the vtuber" never trips it.
+_RE_VTUBER = r"v\s*tub(?:er|ah|a)|vee\s*tuber|vtube|nul\s*vp|null\s*vp|avatar"
+_RE_CALIBRATE = r"re\s*calibrate|calibrate|calibration|re\s*cent(?:er|re)|cent(?:er|re)|reset|re\s*sync"
+_VTUBER_FILLER = {
+    "hey", "ok", "okay", "so", "please", "can", "you", "could", "would", "the",
+    "a", "an", "my", "now", "just", "go", "ahead", "and", "real", "quick",
+    "let", "lets", "us", "do", "again", "him", "her", "it", "up",
+}
+NULVP_CONTROL = ("127.0.0.1", 11114)
+
+
+def _nulvp_running() -> bool:
+    try:
+        return subprocess.run(["pgrep", "-x", "NulVP"], capture_output=True,
+                              timeout=2).returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def try_vtuber_calibrate(text: str) -> Optional[Intent]:
+    """"calibrate vtuber" / "recenter the vtuber" -> NulVP recenters (its F9)."""
+    low = _norm(text)
+    if not low or _too_long(low):
+        return None
+    mc = re.search(rf"\b(?:{_RE_CALIBRATE})\b", low)
+    mv = re.search(rf"\b(?:{_RE_VTUBER})s?\b", low)
+    if not mc or not mv:
+        return None
+    spans = sorted([mc.span(), mv.span()])
+    residual = (low[:spans[0][0]] + " " + low[spans[0][1]:spans[1][0]] + " " + low[spans[1][1]:]).split()
+    if any(tok not in _VTUBER_FILLER for tok in residual):
+        return None
+    if not _nulvp_running():
+        return Intent("The VTuber app isn't running.", [])
+    # Executed inline (UDP to loopback can't block); empty argv = nothing left to run.
+    try:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.sendto(b"recenter", NULVP_CONTROL)
+    except OSError:
+        return Intent("I couldn't reach the VTuber app.", [])
+    return Intent("Recalibrated the VTuber.", [])
+
+
 # Registered parsers, tried in order. Order matters: resize (needs a resize verb +
 # existing-doc words) is checked before new (needs a create verb) — they're
 # otherwise mutually exclusive. try_clip is near the front — a unique bare word.
@@ -974,6 +1024,7 @@ _PARSERS: list[Parser] = [
     try_clip,
     try_stream_command,
     try_obs_camera_bg,
+    try_vtuber_calibrate,
     try_obs_scene,
     try_obs_overlay,
     try_sf_workspace,
