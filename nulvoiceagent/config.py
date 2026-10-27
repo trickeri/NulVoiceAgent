@@ -126,14 +126,26 @@ MANUAL_MAX_SECS = float(os.environ.get("NULVOICEAGENT_MANUAL_MAX_SECS", "120.0")
 # The spoken voice + delivery come from the ACTIVE profile at
 # ~/.config/nulvoiceagent/profiles/<active>.conf — a simple KEY=value file. Keep
 # as many profiles as you like and switch by writing the profile name into the
-# sibling `active` file. Every key is also overridable with an env var. Ships
+# sibling `active` file (NULVOICEAGENT_PROFILE=<name> overrides it for one process,
+# e.g. to audition a profile). Every key is also overridable with an env var. Ships
 # neutral: a stock Kokoro voice, no effects.
-def _active_profile() -> dict:
-    base = CONFIG_DIR / "profiles"
+def _profile_name() -> str:
+    name = os.environ.get("NULVOICEAGENT_PROFILE", "").strip()
+    if name:
+        return name
+    try:
+        return (CONFIG_DIR / "active").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+PROFILE_NAME = _profile_name()
+
+
+def read_profile(name: str) -> dict:
     out: dict[str, str] = {}
     try:
-        name = (CONFIG_DIR / "active").read_text(encoding="utf-8").strip() or "default"
-        for line in (base / f"{name}.conf").read_text(encoding="utf-8").splitlines():
+        for line in (CONFIG_DIR / "profiles" / f"{name}.conf").read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
@@ -143,7 +155,14 @@ def _active_profile() -> dict:
     return out
 
 
-_PROFILE = _active_profile()
+_PROFILE = read_profile(PROFILE_NAME or "default")
+
+# A profile can carry its own character: personas/<profile>.md wins over persona.md,
+# and that profile gets its own chat session so two agents never share a thread.
+_OWN_PERSONA = CONFIG_DIR / "personas" / f"{PROFILE_NAME}.md"
+if PROFILE_NAME and _OWN_PERSONA.is_file():
+    PERSONA_FILE = _OWN_PERSONA
+    CHAT_SESSION_FILE = CACHE_DIR / f"chat-session-{PROFILE_NAME}"
 
 # Optional start/stop cue sounds, played to the default sink when a manual
 # recording begins/ends. Empty (default) = silent. Set SOUND_START / SOUND_STOP in
@@ -177,6 +196,42 @@ LAYER_GAIN = os.environ.get("NULVOICEAGENT_LAYER_GAIN", _PROFILE.get("LAYER_GAIN
 LAYER_LEAD_HPF = os.environ.get("NULVOICEAGENT_LAYER_LEAD_HPF", _PROFILE.get("LAYER_LEAD_HPF", "400")).strip()
 LAYER_DOWN_LPF = os.environ.get("NULVOICEAGENT_LAYER_DOWN_LPF", _PROFILE.get("LAYER_DOWN_LPF", "4000")).strip()
 
+
+def _pfloat(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(f"NULVOICEAGENT_{key}", _PROFILE.get(key, default)))
+    except ValueError:
+        return default
+
+
+# Ghost chain (ghostfx.py): an offline stereo FX chain that REPLACES the plain
+# harmony layer when GHOST > 0. Upper layer = the lead with reverse-reverb ghosting
+# (each word swells in out of its own reversed echo) + a little room, highpassed at
+# LAYER_LEAD_HPF, high-shelved and excited for air (Kokoro stops at 12 kHz). Lower
+# layer = the lead pitched LAYER_PITCH, lowpassed at LAYER_DOWN_LPF, x LAYER_GAIN,
+# dry. Below MONO_BELOW Hz the mix is summed to mono. Needs numpy + ffmpeg (falls
+# back to the plain layer without them).
+GHOST = _pfloat("GHOST", 0.0)                    # reverse-reverb level vs the dry lead
+GHOST_DRY = _pfloat("GHOST_DRY", 1.0)            # dry lead level in the upper layer
+UPPER_GAIN_DB = _pfloat("UPPER_GAIN_DB", 0.0)    # whole upper layer vs the lower one
+GHOST_DECAY = _pfloat("GHOST_DECAY", 1.6)        # seconds of swell before each word
+GHOST_LEADIN = _pfloat("GHOST_LEADIN", 0.5)      # silence added up front for the first swell
+# Lowpass on the ghost only (Hz, 0 = off): reversed "s"/"sh" swells are harsh once the
+# upper layer's EQ + exciter brighten them, so keep the reverb dark and the voice bright.
+GHOST_LPF = _pfloat("GHOST_LPF", 0.0)
+GHOST_ROOM = _pfloat("GHOST_ROOM", 0.18)         # ordinary reverb after the words
+SHELF_HZ = _pfloat("SHELF_HZ", 2500.0)
+SHELF_DB = _pfloat("SHELF_DB", 6.0)
+# Peaking boosts on the upper layer, "HZ:DB,HZ:DB" (e.g. 3000:4,6000:7 like MikuVoice).
+EQ_BANDS = os.environ.get("NULVOICEAGENT_EQ_BANDS", _PROFILE.get("EQ_BANDS", "")).strip()
+EXCITE = _pfloat("EXCITE", 4.0)                  # aexciter amount (0 = off)
+EXCITE_HZ = _pfloat("EXCITE_HZ", 4500.0)
+MONO_BELOW = _pfloat("MONO_BELOW", 180.0)        # 0 = no mono low end
+OUT_GAIN_DB = _pfloat("OUT_GAIN_DB", 6.0)        # output peak vs the dry lead's peak
+# Loudness target instead of OUT_GAIN_DB (0 = off): a gentle compressor, gain to this
+# integrated loudness, then a light limiter for stray peaks. Loud without pumping.
+LUFS = _pfloat("LUFS", 0.0)
+
 # Word-timed caption of everything she says -> $CACHE/caption.json, for an optional
 # reader such as the desktop speech-bubble overlay (see caption.py). CAPTION_DELAY
 # (seconds) shifts the caption later to cover playback start-up / FX-chain latency.
@@ -187,12 +242,8 @@ except ValueError:
     CAPTION_DELAY = 0.08
 # Who's talking, shown as the caption's speaker ("Aurinex:" atop the speech bubble).
 # Profile NAME=, else the active profile's name, title-cased.
-try:
-    _ACTIVE_NAME = (CONFIG_DIR / "active").read_text(encoding="utf-8").strip()
-except OSError:
-    _ACTIVE_NAME = ""
 AGENT_NAME = os.environ.get("NULVOICEAGENT_AGENT_NAME",
-                            _PROFILE.get("NAME", _ACTIVE_NAME.title())).strip()
+                            _PROFILE.get("NAME", PROFILE_NAME.title())).strip()
 
 # --- "agent is done" announcer (Claude/Codex Stop hooks) ---------------------
 # Speak a short confirmation when a Claude Code or Codex turn finishes, then

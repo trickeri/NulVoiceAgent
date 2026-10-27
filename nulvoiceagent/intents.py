@@ -918,6 +918,44 @@ def try_narrate(text: str) -> Optional[Intent]:
     return Intent(say, [])
 
 
+# --- Screen translate: OCR Chinese/Japanese/Korean on the active monitor ------ #
+# "translate" / "translate korean" / "translate that" -> nultranslate (one shot:
+# screenshot -> OCR -> Claude Haiku -> click-through bubbles for 30s). Bare
+# "translate" reads Chinese+Japanese, then Korean only if that found nothing;
+# naming Korean skips straight to the Korean recognizer. Whole
+# utterance must be the command: only these words may follow the trigger, so
+# "translate this paragraph into French for my email" still goes to the brain.
+_RE_TRANSLATE = re.compile(r"^(?:translate|translation|translator)\b")
+_TRANSLATE_FILLER = {
+    "chinese", "mandarin", "japanese", "korean", "that", "this", "it", "the", "screen", "these", "those",
+    "them", "names", "name", "guild", "guilds", "player", "players", "text",
+    "characters", "here", "on", "please", "now", "for", "me", "real", "quick",
+}
+_RE_TRANSLATE_CLEAR = re.compile(
+    r"^(?:(?:clear|hide|close|remove|dismiss|kill)\s+(?:the\s+)?translations?"
+    r"|translations?\s+(?:off|away|gone))$")
+
+
+def try_translate(text: str) -> Optional[Intent]:
+    low = _norm(text)
+    if _RE_TRANSLATE_CLEAR.match(low):
+        return Intent("", ["nultranslate", "--clear"])
+    m = _RE_TRANSLATE.match(low)
+    if not m or _too_long(low):
+        return None
+    words = low[m.end():].split()
+    if any(w not in _TRANSLATE_FILLER for w in words):
+        return None
+    lang = "auto"
+    if "korean" in words:
+        lang = "korean"
+    elif {"chinese", "mandarin", "japanese"} & set(words):
+        lang = "cjk"
+    # Silent: the overlay's own "Translating…" pill is the feedback, and a spoken
+    # ack would talk over the game.
+    return Intent("", ["nultranslate", "--lang", lang])
+
+
 _RE_NARR_PAUSE = re.compile(r"^(?:pause|hold\s+(?:on|up)|wait)\b", re.IGNORECASE)
 _RE_NARR_RESUME = re.compile(
     r"^(?:resume|continue|unpause|carry\s+on|go\s+on|go\s+ahead|"
@@ -1010,6 +1048,159 @@ def try_vtuber_calibrate(text: str) -> Optional[Intent]:
     return Intent("Recalibrated the VTuber.", [])
 
 
+# --- NulVideo takes: "start recording" (3-2-1 countdown) / "stop recording" -- #
+# Talks to the running editor's control FIFO ($XDG_RUNTIME_DIR/nulvideo-ctl, the
+# same channel as the Meta+R hotkey). Start counts "three, two, one, go" in the
+# agent voice and starts the take on "go". Stop sends the hotkey-press time
+# (__main__._stamp_press) so NulVideo cuts the take back to it: the spoken "stop
+# recording" and the agent's processing time never end up in the take.
+# Fires only on a short utterance that is a record word + a start/stop verb and
+# nothing else but filler — chat ABOUT recording never trips it.
+_REC_WORDS = {"recording", "record", "take"}
+_REC_START = {"start", "begin", "hit", "roll", "rolling", "go"}
+_REC_STOP = {"stop", "end", "finish", "cut", "kill"}
+_REC_FILLER = {
+    "hey", "ok", "okay", "so", "please", "can", "you", "could", "would", "the",
+    "a", "an", "my", "now", "just", "ahead", "and", "lets", "let", "us", "do",
+    "new", "video", "this", "that", "it", "on", "real", "quick", "time", "to",
+    "s", "hermes",  # "let's" normalizes to "let s"; "hey Hermes, start recording"
+}
+_REC_MAX_WORDS = 8
+NULVIDEO_CTL = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
+                            "nulvideo-ctl")
+
+
+def _nulvideo_send(line: str) -> bool:
+    """Write one command line to a LISTENING NulVideo. Opening a FIFO write-only
+    and non-blocking fails (ENXIO) when no editor reads it, so a stale FIFO from
+    a closed editor reads as "not running" instead of hanging the turn."""
+    try:
+        fd = os.open(NULVIDEO_CTL, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        os.write(fd, (line + "\n").encode())
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _nulvideo_listening() -> bool:
+    try:
+        fd = os.open(NULVIDEO_CTL, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
+def _countdown_then(line: str) -> bool:
+    """Say "three, two, one, go" one second apart in the agent voice, sending
+    `line` to NulVideo as "go" starts. All four words are synthesized up front
+    (in parallel) so the beats land on time instead of waiting on each synth."""
+    import tempfile
+    import threading
+    from . import config, tts
+    words = ["Three.", "Two.", "One.", "Go!"]
+    wavs: list[Optional[bytes]] = [None] * len(words)
+
+    def synth(i: int) -> None:
+        try:
+            wavs[i] = tts.synth(words[i])
+        except Exception:  # noqa: BLE001 — a silent beat is better than no take
+            wavs[i] = None
+
+    threads = [threading.Thread(target=synth, args=(i,)) for i in range(len(words))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+    target = ["--target", config.TTS_SINK] if config.TTS_SINK and tts._sink_present(config.TTS_SINK) else []
+    with tempfile.TemporaryDirectory() as d:
+        paths = []
+        for i, wav in enumerate(wavs):
+            p = None
+            if wav:
+                p = os.path.join(d, f"{i}.wav")
+                with open(p, "wb") as f:
+                    f.write(wav)
+            paths.append(p)
+        # The voice FX put ~0.75-0.85 s of lead-in before each word (varying per
+        # word), so schedule every clip by its own speech onset: the audible
+        # beats land exactly 1 s apart and the take starts on the audible "go".
+        onsets = [_speech_onset(w) if w else 0.0 for w in wavs]
+        t0 = time.monotonic() + max(onsets)
+        events = sorted([(t0 + i - onsets[i], "play", i) for i in range(len(paths)) if paths[i]] +
+                        [(t0 + len(words) - 1, "send", -1)])
+        players = []
+        for when, kind, i in events:
+            delay = when - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            if kind == "send":
+                if not _nulvideo_send(line):
+                    return False
+            else:
+                players.append(subprocess.Popen(["pw-play", *target, paths[i]],
+                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        for pl in players:          # keep the temp files until "go" finishes
+            pl.wait(timeout=5)
+    return True
+
+
+def _speech_onset(wav: bytes) -> float:
+    """Seconds into a 16-bit WAV where the voice starts (first sample above 10%
+    of the clip's peak); 0 if it can't be read."""
+    import array
+    import io
+    import wave
+    try:
+        with wave.open(io.BytesIO(wav), "rb") as w:
+            fr, ch, sw = w.getframerate() or 24000, w.getnchannels(), w.getsampwidth()
+            raw = w.readframes(w.getnframes())
+    except (wave.Error, OSError, ValueError):
+        return 0.0
+    if sw != 2:
+        return 0.0
+    a = array.array("h")
+    a.frombytes(raw)
+    a = a[0::ch]
+    peak = max((abs(x) for x in a), default=0)
+    if peak == 0:
+        return 0.0
+    for i, x in enumerate(a):
+        if abs(x) > 0.1 * peak:
+            return i / fr
+    return 0.0
+
+
+def try_record(text: str) -> Optional[Intent]:
+    low = _norm(text)
+    toks = low.split()
+    if not toks or len(toks) > _REC_MAX_WORDS or not (_REC_WORDS & set(toks)):
+        return None
+    if any(t not in _REC_WORDS | _REC_START | _REC_STOP | _REC_FILLER for t in toks):
+        return None
+    words = set(toks)
+    stop = bool(_REC_STOP & words)
+    # "take" alone isn't a command ("take that"): starting needs a start verb or
+    # "record" itself as the verb ("go ahead and record").
+    start = bool(_REC_START & words) or "record" in words
+    if stop == start:
+        return None                  # neither, or both ("stop and start recording")
+    if not _nulvideo_listening():
+        return Intent("The video editor isn't open.", [])
+    if stop:
+        press = os.environ.get("NULVOICEAGENT_PRESS_NS", "")
+        ok = _nulvideo_send(f"recstop:{press}" if press.isdigit() else "recstop")
+        return Intent("Stopped recording." if ok else "I couldn't reach the video editor.", [])
+    if not _countdown_then("recstart"):
+        return Intent("I couldn't reach the video editor.", [])
+    return Intent("", [])            # the countdown already said it all
+
+
 # Registered parsers, tried in order. Order matters: resize (needs a resize verb +
 # existing-doc words) is checked before new (needs a create verb) — they're
 # otherwise mutually exclusive. try_clip is near the front — a unique bare word.
@@ -1019,9 +1210,11 @@ def try_vtuber_calibrate(text: str) -> Optional[Intent]:
 # scene/overlay/chat command).
 _PARSERS: list[Parser] = [
     try_narration_control,
+    try_record,
     try_narrate,
     try_voice_switch,
     try_clip,
+    try_translate,
     try_stream_command,
     try_obs_camera_bg,
     try_vtuber_calibrate,

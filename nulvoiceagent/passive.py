@@ -127,6 +127,14 @@ def _avatar_state() -> str:
     return s
 
 
+def _off_script(reply: str) -> bool:
+    """True when an interjection isn't a short spoken remark: markdown, a list,
+    several paragraphs, or far too long to be one or two sentences."""
+    r = reply.strip()
+    return (len(r) > 400 or "\n\n" in r or "**" in r or "`" in r
+            or any(ln.lstrip()[:2] in ("1.", "- ", "* ", "# ") for ln in r.splitlines()))
+
+
 def _dictation_live() -> bool:
     """A voicechat DICTATION turn is in flight (Meta+CapsLock). voicechat is a
     separate daemon with its own capture — it publishes
@@ -291,6 +299,13 @@ def _interject(text: str, history: list | None = None) -> tuple[bool, str]:
         secs = time.monotonic() - t0
         if brain.is_pass(reply):
             _log(f"passive: PASS  (brain={secs:.2f}s)")
+            state.idle()
+        elif _off_script(reply):
+            # A remark is one or two spoken sentences. Anything essay-shaped means
+            # the brain lost the plot (e.g. critiqued its own prompt) — don't
+            # read it aloud.
+            _log(f"passive: dropped off-script reply (brain={secs:.2f}s): "
+                 f"{reply[:200]!r}")
             state.idle()
         elif _dictation_live():
             # He started dictating during the (multi-second) brain call. Drop the

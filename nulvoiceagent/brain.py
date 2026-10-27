@@ -47,13 +47,19 @@ _LIMIT_RE = re.compile(
     re.IGNORECASE)
 
 
-def _check_available(brain: str, proc: subprocess.CompletedProcess) -> None:
+def _check_available(brain: str, proc: subprocess.CompletedProcess,
+                     prompt: str = "") -> None:
     """Raise BrainUnavailable if `brain`'s subprocess shows it couldn't answer —
     out of tokens / over its usage limit, or a hard non-zero exit. The caller
     retries the turn on the fallback brain. Called by the codex/hermes backends
     (the ones that can be a PRIMARY); the claude backend is terminal, so it never
     self-checks — we don't fall back away from the fallback."""
     blob = f"{proc.stderr or ''}\n{proc.stdout or ''}"
+    # `codex exec` echoes the whole prompt to stderr — persona included, and the
+    # persona itself talks about the provider being "out of tokens". Strip the echo
+    # so only what the CLI itself printed can trip the limit check.
+    if prompt:
+        blob = blob.replace(prompt, "")
     if _LIMIT_RE.search(blob):
         detail = (proc.stderr or proc.stdout or "").strip()[-160:]
         raise BrainUnavailable(f"{brain} is out of tokens: {detail}")
@@ -231,7 +237,7 @@ def _hermes_chat(text: str, reset: bool) -> str:
     out = proc.stdout.strip()
     # If Codex (Hermes' provider) is out of tokens, or Hermes bailed, hand off to
     # the fallback brain rather than speaking an error.
-    _check_available("hermes", proc)
+    _check_available("hermes", proc, text)
     return out
 
 
@@ -266,7 +272,7 @@ def _codex_chat(text: str, reset: bool) -> str:
                 "--skip-git-repo-check", "--color", "never", "-o", out_path]
                + effort + model + [prompt])
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    _check_available("codex", proc)   # out of tokens / hard error -> fall back to claude
+    _check_available("codex", proc, cmd[-1])   # out of tokens / hard error -> fall back to claude
     # On the first turn (or after reset) capture the new session id for continuity.
     if not sid:
         new = _codex_session_id(proc.stderr)
@@ -299,7 +305,7 @@ def _codex_classify(text: str, names: list[str]) -> dict:
               f"Use 'none' if nothing fits. 'say' is a short spoken confirmation. "
               f"Request: {text!r}")
     proc = subprocess.run(opts + [prompt], capture_output=True, text=True)
-    _check_available("codex", proc)   # out of tokens / hard error -> fall back to claude
+    _check_available("codex", proc, prompt)   # out of tokens / hard error -> fall back to claude
     return _parse_action(_read_out(out_path, proc), names)
 
 
@@ -331,10 +337,24 @@ def _scrub_provider_notice(reply: str) -> str:
     return reply
 
 
+def _split_system(text: str) -> tuple[str, str]:
+    """Split a turn into (what the user said, appended [SYSTEM] framing). Every
+    hint is appended after the user's words, so the first [SYSTEM] marker is the
+    seam."""
+    said, sep, rest = text.partition("\n\n[SYSTEM]")
+    return said, (sep + rest).strip() if sep else ""
+
+
 def _claude_chat(text: str, reset: bool) -> str:
     sid = None if reset else _read_session()
-    cmd = ["claude", "-p", text, "--output-format", "json",
-           "--append-system-prompt", PERSONA,
+    # Claude Code reads a user turn full of [SYSTEM] instructions as a prompt to
+    # REVIEW (it once answered an overheard fragment with a numbered critique of
+    # the eavesdrop framing). So the framing rides in the system prompt and the
+    # user turn is only what he said.
+    said, framing = _split_system(text)
+    system = PERSONA + ("\n\n" + framing if framing else "")
+    cmd = ["claude", "-p", said or text, "--output-format", "json",
+           "--append-system-prompt", system,
            "--allowed-tools", "Read,Grep,Glob,WebSearch,WebFetch",
            "--disallowed-tools", "Write,Edit,NotebookEdit,Bash"]
     if config.CHAT_MODEL:
@@ -700,7 +720,7 @@ def complete(instruction: str, system_prompt: str, claude_model: str = "") -> st
                 cmd + [system_prompt + "\n\n" + instruction],
                 capture_output=True, text=True, timeout=180)
             if proc.returncode != 0:
-                _check_available("codex", proc)
+                _check_available("codex", proc, system_prompt + "\n\n" + instruction)
             reply = _read_out(out_path, proc)
             if not reply or _PROVIDER_NOTICE_RE.search(reply[:200]):
                 raise BrainUnavailable("codex returned no usable answer")

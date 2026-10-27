@@ -75,6 +75,22 @@ def synth(text: str, voice: str | None = None, pitch: str | None = None,
             _last_words = json.loads(base64.b64decode(whdr))
         except (ValueError, TypeError):
             _last_words = []
+    if config.GHOST > 0:
+        try:
+            from . import ghostfx
+            wav, lead_in = ghostfx.process(wav)
+            # The chain adds silence up front for the first swell: shift timings with it.
+            for w in _last_words:
+                for k in ("s", "e"):
+                    if w.get(k) is not None:
+                        w[k] = float(w[k]) + lead_in
+            for a in _last_align:
+                for k in ("start", "end"):
+                    if a.get(k) is not None:
+                        a[k] = float(a[k]) + lead_in
+            return wav
+        except Exception:  # noqa: BLE001 — no numpy/ffmpeg/rubberband: plain layer below
+            pass
     if config.LAYER_PITCH:
         try:
             wav = _layer(wav, float(config.LAYER_PITCH), float(config.LAYER_GAIN or "0.7"))

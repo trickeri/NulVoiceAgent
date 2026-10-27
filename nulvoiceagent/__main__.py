@@ -22,6 +22,7 @@ Mic-free testing / scripting:
   nulvoiceagent newtopic        forget the chat conversation context
   nulvoiceagent passive         passive-listening daemon loop (eavesdrop + occasional interjection; run via nulvoiceagent-passive.service)
   nulvoiceagent passive-toggle [x]  start/stop the eavesdrop service; x = toggle(default)|on|off|status
+  nulvoiceagent profile [name]  list agent profiles (* = active, tab, display name), or switch to <name>
 
 Global: --brain codex|claude overrides NULVOICEAGENT_BRAIN for this run.
 """
@@ -147,12 +148,21 @@ def _interrupt_active_turn() -> bool:
     return True
 
 
+def _stamp_press() -> None:
+    """Remember when this voice turn's hotkey was pressed (CLOCK_MONOTONIC ns,
+    the clock NulVideo's recorder uses). intents.try_record passes it on, so a
+    spoken "stop recording" cuts the take back to the press -- the phrase and the
+    agent's thinking time never land in it. Inherited by anything we spawn."""
+    os.environ["NULVOICEAGENT_PRESS_NS"] = str(time.monotonic_ns())
+
+
 def _chat_toggle() -> None:
     """Press to start; press again (or any voice hotkey) to stop + process.
     Pressing while a previous reply is still thinking/speaking interrupts it
     (kills the speech) and starts a fresh recording — barge-in."""
     if _stop_active_recording():
         return
+    _stamp_press()
     _interrupt_active_turn()         # shut up an in-progress reply, then listen
     _pause_narration()               # ...and a narration, so the mic hears only him
     _REC_PID.write_text(str(os.getpid()))
@@ -192,6 +202,7 @@ def _route_toggle() -> None:
     voice hotkey) to stop + route it to a named pane. No silence cutoff."""
     if _stop_active_recording():
         return
+    _stamp_press()
     _interrupt_active_turn()
     _REC_PID.write_text(str(os.getpid()))
     tts.cue("start")
@@ -379,6 +390,7 @@ def main(argv: list[str]) -> int:
     elif cmd == "command":
         # any hotkey press during a live chat recording ends it instead
         if not _stop_active_recording():
+            _stamp_press()
             _interrupt_active_turn()       # barge in on a still-speaking reply
             _pause_narration()
             state.listening()
@@ -580,6 +592,26 @@ def main(argv: list[str]) -> int:
                             "stop" if active else "start", unit], check=False)
             new = not active
         print("listening" if new else "off")
+    elif cmd == "profile":
+        # List the agent profiles (~/.config/nulvoiceagent/profiles/*.conf) or switch
+        # the active one. Called by the taskbar avatar's Agent submenu. Every voice turn
+        # is a fresh process and picks the new profile up on its own; the eavesdrop
+        # daemon reads config once, so it gets restarted (only if it was running).
+        import subprocess
+        names = sorted(p.stem for p in (config.CONFIG_DIR / "profiles").glob("*.conf"))
+        if rest:
+            name = rest[0].strip().lower()
+            if name not in names:
+                print(f"no such profile: {name} (have: {', '.join(names)})", file=sys.stderr)
+                return 2
+            (config.CONFIG_DIR / "active").write_text(name + "\n", encoding="utf-8")
+            subprocess.run(["systemctl", "--user", "try-restart",
+                            "nulvoiceagent-passive.service"], check=False)
+            print(name)
+            return 0
+        for n in names:
+            shown = config.read_profile(n).get("NAME") or n.title()
+            print(f"{'*' if n == config.PROFILE_NAME else ' '}{n}\t{shown}")
     elif cmd == "newtopic":
         brain.reset_session()
         tts.speak("Okay, fresh start. What's on your mind?")
