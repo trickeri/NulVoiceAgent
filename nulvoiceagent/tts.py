@@ -166,10 +166,11 @@ def _sink_present(name: str) -> bool:
         return False
 
 
-def play(wav: bytes) -> None:
+def play(wav: bytes, abort=None) -> None:
     """Play WAV via pw-play. Dry to the default sink unless config.TTS_SINK names a
     present PipeWire sink (e.g. your own effects chain), in which case it routes
-    there; falls back to the default sink if that sink isn't present."""
+    there; falls back to the default sink if that sink isn't present. `abort`
+    (optional callable) is polled during playback; True cuts the audio off."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
         f.write(wav)
         f.flush()
@@ -180,8 +181,16 @@ def play(wav: bytes) -> None:
             cmd.append(f.name)
         else:
             cmd = ["paplay", f.name]
-        subprocess.run(cmd, check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        while True:
+            try:
+                proc.wait(timeout=0.15)
+                return
+            except subprocess.TimeoutExpired:
+                if abort is not None and abort():
+                    proc.terminate()
+                    proc.wait()
+                    return
 
 
 def _mouth_envelope(wav: bytes, hop: float = 0.025) -> tuple[list[float], float]:
@@ -243,8 +252,10 @@ def _drive_mouth(env: list[float], hop: float, dur: float, until: float,
 
 
 def speak(text: str, voice: str | None = None, pitch: str | None = None,
-          speed: str | None = None, speaker: str | None = None) -> None:
-    """`speaker` labels the caption (default: config.AGENT_NAME)."""
+          speed: str | None = None, speaker: str | None = None, abort=None) -> None:
+    """`speaker` labels the caption (default: config.AGENT_NAME). `abort` (optional
+    callable, e.g. a mute check) is re-checked after synthesis and during playback,
+    so a mute that lands while the line is being made still silences it."""
     global last_synth_secs
     text = (text or "").strip()
     if not text:
@@ -252,6 +263,8 @@ def speak(text: str, voice: str | None = None, pitch: str | None = None,
     _s = time.monotonic()
     wav = synth(text, voice=voice, pitch=pitch, speed=speed)
     last_synth_secs = time.monotonic() - _s
+    if abort is not None and abort():
+        return
     # Publish "talking" state (with the audio duration as a backstop) so an optional
     # avatar/status reader can animate while we speak, then drop back to idle. play()
     # blocks until the audio finishes, so this brackets the whole reply. A background
@@ -270,7 +283,7 @@ def speak(text: str, voice: str | None = None, pitch: str | None = None,
         driver.start()
     cid = caption.show(text, _last_words, dur, speaker)
     try:
-        play(wav)
+        play(wav, abort)
     finally:
         caption.clear(cid)
         stop.set()

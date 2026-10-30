@@ -635,7 +635,7 @@ def _announce(who: str, n_questions: int) -> None:
     opts = "an option" if n_questions <= 1 else "some options"
     phrase = random.choice(_PHRASES).format(who=who, q=q, opts=opts)
     _log(f"announce who={who!r} n={n_questions} -> {phrase!r}")
-    tts.speak(phrase)
+    tts.speak(phrase, abort=_muted)
 
 
 def _num_word(n: int) -> str:

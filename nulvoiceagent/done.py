@@ -707,17 +707,18 @@ def run(payload: dict, default_who: str = "Claude") -> None:
     _stash_completion(who, kind, asst_text)
     phrase = _pick_phrase(kind).format(who=who)
     _log(f"who={who!r} type={kind} -> {phrase!r}")
-    tts.speak(phrase)
+    tts.speak(phrase, abort=is_muted)    # muted mid-synth/playback -> stays silent
 
     # Convenience no-hotkey path: listen briefly for an immediate "summarize".
-    if _busy():
+    if _busy() or is_muted():
         return
     heard = stt.listen(onset_timeout=config.DONE_LISTEN_SECS)
     if not heard:
         return
     _log(f"heard: {heard!r}")
     if _SUMMARY_KW.search(heard):
-        tts.speak(make_summary(heard) or "There wasn't really anything to summarize.")
+        tts.speak(make_summary(heard) or "There wasn't really anything to summarize.",
+                  abort=is_muted)
 
 
 def run_detached(payload: dict, default_who: str = "Claude") -> None:
