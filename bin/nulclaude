@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# nulclaude — shorthand for `nulvoiceagent claude …` (remote Claude/Codex pane control, JSON out).
+exec "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/nulvoiceagent" claude "$@"

@@ -567,7 +567,9 @@ def pane_alive(pane: str) -> bool:
 # interrupt)" footer so this also works on builds/tool-run states that show it
 # (and so it's robust if the spinner line momentarily isn't captured). NB: the
 # bypass-permissions prompt says "Esc to cancel" — deliberately not matched.
-_RE_BUSY = re.compile(r"…\s*\(\s*\d+\s*s\b|esc\b[^.\n]*\binterrupt\b", re.IGNORECASE)
+# The timer grows units past a minute ("(2m 27s", "(1h 3m"), so match the first
+# number+unit, not just seconds — a seconds-only anchor read long turns as idle.
+_RE_BUSY = re.compile(r"…\s*\(\s*\d+\s*[hms]\b|esc\b[^.\n]*\binterrupt\b", re.IGNORECASE)
 
 
 def pane_busy(pane: str) -> bool:

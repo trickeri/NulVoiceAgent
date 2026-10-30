@@ -20,6 +20,8 @@ Mic-free testing / scripting:
   nulvoiceagent done-voice-only [x]  announce only VOICE-started tasks (typed tasks stay silent); x = toggle(default)|on|off|status
   nulvoiceagent ledger          what phrasing she's over-using + the hint it would inject
   nulvoiceagent newtopic        forget the chat conversation context
+  nulvoiceagent claude <verb>    drive Claude/Codex panes as JSON (see sessions.py;
+                                 list/read/send/wait/ask/question/answer/new/end)
   nulvoiceagent passive         passive-listening daemon loop (eavesdrop + occasional interjection; run via nulvoiceagent-passive.service)
   nulvoiceagent passive-toggle [x]  start/stop the eavesdrop service; x = toggle(default)|on|off|status
   nulvoiceagent profile [name]  list agent profiles (* = active, tab, display name), or switch to <name>
@@ -376,6 +378,10 @@ def main(argv: list[str]) -> int:
 
     cmd, rest = argv[0], argv[1:]
     text = " ".join(rest)
+
+    if cmd == "claude":
+        from . import sessions
+        return sessions.main(rest)
 
     # Voice modes run as their own process group so an interrupting hotkey can
     # take the whole group (Python + pw-play) down in one killpg — barge-in.
