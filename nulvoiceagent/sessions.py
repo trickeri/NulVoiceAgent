@@ -15,7 +15,9 @@ can drive sessions deterministically:
     nulvoiceagent claude question <target>
     nulvoiceagent claude answer <target> <pick> [<pick> …]     # "2" / "1,3"
     nulvoiceagent claude interrupt <target>
-    nulvoiceagent claude new <name> <dir> [claude|codex]
+    nulvoiceagent claude windows [<window>]       # Ghostty/tmux windows, panes by row/col + state
+    nulvoiceagent claude start <pane|empty|empty:<window>> <dir> <name…> [--codex]
+    nulvoiceagent claude new <name> <dir> [claude|codex]   # in a NEW pane (tmux session "remote")
     nulvoiceagent claude end <target>
     nulvoiceagent claude name <target> <name>
 
@@ -54,6 +56,127 @@ def _panes() -> list[dict]:
                      "cwd": cwd, "where": where,
                      "agent": _AGENT_CMDS.get(cmd.lower())})
     return rows
+
+
+_SHELLS = {"zsh", "bash", "fish", "sh", "dash"}
+_WIN_FIELDS = ("#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_current_command}\t"
+               "#{pane_pid}\t#{pane_current_path}\t#{@va_name}\t#{pane_left}\t#{pane_top}\t"
+               "#{pane_width}\t#{pane_height}")
+
+
+def _focused_window() -> Optional[str]:
+    pane = dispatch.active_pane()
+    if not pane:
+        return None
+    cp = dispatch._tmux("display-message", "-p", "-t", pane, "#{session_name}:#{window_index}")
+    return cp.stdout.strip() or None
+
+
+def _shell_state(pane: str, pid: str) -> str:
+    """'empty' = a bare shell prompt (no children, nothing on screen but the prompt);
+    'shell' = an idle shell with history on screen."""
+    import subprocess
+    if subprocess.run(["pgrep", "-P", pid], capture_output=True).returncode == 0:
+        return "shell-busy"
+    cp = dispatch._tmux("capture-pane", "-p", "-t", pane)
+    lines = [ln for ln in cp.stdout.splitlines() if ln.strip()]
+    return "empty" if len(lines) <= 2 else "shell"
+
+
+def windows() -> dict:
+    """Every tmux window (= one Ghostty window, since each Ghostty window owns a
+    `w<pid>` session) with its panes laid out in rows/columns, each pane
+    classified: empty | shell | shell-busy | claude/codex (idle|busy|question) |
+    <other program>."""
+    cp = dispatch._tmux("list-panes", "-a", "-F", _WIN_FIELDS)
+    wins: dict[str, dict] = {}
+    for ln in cp.stdout.splitlines():
+        p = ln.split("\t")
+        if len(p) != 11:
+            continue
+        sess, widx, pane, cmd, pid, cwd, name, left, top, w, h = p
+        key = f"{sess}:{widx}"
+        wins.setdefault(key, {"window": key, "ghostty": sess.startswith("w") and sess[1:].isdigit(),
+                              "panes": []})
+        agent = _AGENT_CMDS.get(cmd.lower())
+        if agent:
+            state = f"{agent}:{_state(pane)}"
+        elif cmd.lower() in _SHELLS:
+            state = _shell_state(pane, pid)
+        else:
+            state = cmd
+        wins[key]["panes"].append({"pane": pane, "name": name.strip() or None, "command": cmd,
+                                   "cwd": cwd, "state": state, "_xy": (int(top), int(left))})
+    focused = _focused_window()
+    out = []
+    for key, win in wins.items():
+        panes = win["panes"]
+        tops = sorted({p["_xy"][0] for p in panes})
+        for p in panes:
+            row = tops.index(p["_xy"][0])
+            cols = sorted(q["_xy"][1] for q in panes if q["_xy"][0] == p["_xy"][0])
+            p["position"] = f"row {row + 1} col {cols.index(p['_xy'][1]) + 1}"
+        for p in panes:
+            p.pop("_xy")
+        panes.sort(key=lambda p: p["position"])
+        win["pane_count"] = len(panes)
+        win["empty_panes"] = [p["pane"] for p in panes if p["state"] == "empty"]
+        win["focused"] = key == focused
+        out.append(win)
+    out.sort(key=lambda w: (not w["focused"], -w["pane_count"]))
+    return {"ok": True, "windows": out}
+
+
+def _pick_window(sel: str, wins: list) -> Optional[dict]:
+    """'w33627' / 'w33627:1' / '8' or '8-pane' (pane count) / 'focused' / '' (any)."""
+    s = sel.strip().lower().removesuffix("-pane").removesuffix(" pane").removesuffix("pane").strip()
+    if not s:
+        return None
+    if s in ("focused", "this", "current"):
+        return next((w for w in wins if w["focused"]), None)
+    if s.isdigit():
+        hits = [w for w in wins if w["pane_count"] == int(s)]
+        return hits[0] if len(hits) == 1 else (hits[0] if hits else None)
+    return next((w for w in wins if w["window"].lower() == s or w["window"].split(":")[0].lower() == s), None)
+
+
+def start_in_pane(where: str, cwd: str, name: str, tool: str = "claude") -> dict:
+    """Start an agent in an EXISTING pane and name it. `where` = a pane id, or
+    'empty' / 'empty:<window selector>' to take the first empty pane (in that
+    window). The pane must be an idle shell; we never type into a running program."""
+    import os
+    import shlex
+    cwd = os.path.expanduser(cwd)
+    if not os.path.isdir(cwd):
+        return {"ok": False, "error": f"no such directory: {cwd}"}
+    if tool not in config.SESSION_LAUNCH:
+        return {"ok": False, "error": f"tool must be one of {sorted(config.SESSION_LAUNCH)}"}
+    wins = windows()["windows"]
+    allp = {p["pane"]: (w, p) for w in wins for p in w["panes"]}
+    if where.lower().startswith("empty"):
+        sel = where.partition(":")[2]
+        win = _pick_window(sel, wins) if sel else None
+        if sel and win is None:
+            return {"ok": False, "error": f"no window matches {sel!r}",
+                    "windows": [{"window": w["window"], "panes": w["pane_count"]} for w in wins]}
+        pool = [win] if win else wins
+        pane = next((pid for w in pool for pid in w["empty_panes"]), None)
+        if pane is None:
+            return {"ok": False, "error": "no empty pane" + (f" in {win['window']}" if win else "")}
+    else:
+        pane = where if where in allp else resolve(where)
+        if pane is None or pane not in allp:
+            return {"ok": False, "error": f"no pane matches {where!r}"}
+    state = allp[pane][1]["state"]
+    if state not in ("empty", "shell"):
+        return {"ok": False, "error": f"pane {pane} isn't an idle shell (state: {state})"}
+    if dispatch._match_key(name, dispatch.load()) == name:
+        return {"ok": False, "error": f"a pane named {name!r} already exists"}
+    dispatch.register(name, pane)
+    dispatch.run_in_pane(pane, f"cd {shlex.quote(cwd)} && {config.SESSION_LAUNCH[tool]}")
+    w, p = allp[pane]
+    return {"ok": True, "pane": pane, "name": name, "cwd": cwd, "tool": tool,
+            "window": w["window"], "position": p["position"]}
 
 
 def _state(pane: str) -> str:
@@ -238,6 +361,18 @@ def main(argv: list[str]) -> int:
     try:
         if verb == "list":
             res = list_sessions("--all" in rest)
+        elif verb in ("windows", "panes"):
+            res = windows()
+            if rest:
+                win = _pick_window(" ".join(rest), res["windows"])
+                res = {"ok": win is not None, "windows": [win] if win else [],
+                       **({} if win else {"error": f"no window matches {' '.join(rest)!r}"})}
+        elif verb == "start":
+            if len(rest) < 3:
+                raise ValueError("usage: start <pane|empty|empty:<window>> <dir> <name…> [--codex]")
+            tool = "codex" if "--codex" in rest else "claude"
+            rest = [a for a in rest if a != "--codex"]
+            res = start_in_pane(rest[0], rest[1], " ".join(rest[2:]), tool)
         elif verb == "new":
             if len(rest) < 2:
                 raise ValueError("usage: new <name> <dir> [claude|codex]")
