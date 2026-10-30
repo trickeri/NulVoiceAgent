@@ -16,6 +16,7 @@ can drive sessions deterministically:
     nulvoiceagent claude answer <target> <pick> [<pick> …]     # "2" / "1,3"
     nulvoiceagent claude interrupt <target>
     nulvoiceagent claude windows [<window>]       # Ghostty/tmux windows, panes by row/col + state
+    nulvoiceagent claude name-window <window> <name…>   # e.g. "Master Agent Window"
     nulvoiceagent claude start <pane|empty|empty:<window>> <dir> <name…> [--codex]
     nulvoiceagent claude new <name> <dir> [claude|codex]   # in a NEW pane (tmux session "remote")
     nulvoiceagent claude end <target>
@@ -61,7 +62,32 @@ def _panes() -> list[dict]:
 _SHELLS = {"zsh", "bash", "fish", "sh", "dash"}
 _WIN_FIELDS = ("#{session_name}\t#{window_index}\t#{pane_id}\t#{pane_current_command}\t"
                "#{pane_pid}\t#{pane_current_path}\t#{@va_name}\t#{pane_left}\t#{pane_top}\t"
-               "#{pane_width}\t#{pane_height}")
+               "#{pane_width}\t#{pane_height}\t#{@va_window_name}")
+
+
+# Named windows. A window's name lives in its tmux user option @va_window_name
+# (also shown as the tmux window name). Since every Ghostty window gets a fresh
+# `w<pid>` session, a RULE names windows by shape so the name survives reopening:
+# ~/.config/nulvoiceagent/windows.json = {"<Name>": {"pane_count": N}}. The first
+# unnamed window matching a rule gets tagged with it.
+WINDOW_RULES_PATH = config.CONFIG_DIR / "windows.json"
+_DEFAULT_WINDOW_RULES = {"Master Agent Window": {"pane_count": 8}}
+
+
+def _window_rules() -> dict:
+    try:
+        return json.loads(WINDOW_RULES_PATH.read_text())
+    except FileNotFoundError:
+        WINDOW_RULES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        WINDOW_RULES_PATH.write_text(json.dumps(_DEFAULT_WINDOW_RULES, indent=1) + "\n")
+        return dict(_DEFAULT_WINDOW_RULES)
+    except ValueError:
+        return dict(_DEFAULT_WINDOW_RULES)
+
+
+def name_window(key: str, name: str) -> None:
+    dispatch._tmux("set", "-w", "-t", key, "@va_window_name", name)
+    dispatch._tmux("rename-window", "-t", key, name)   # visible in the status bar
 
 
 def _focused_window() -> Optional[str]:
@@ -92,11 +118,12 @@ def windows() -> dict:
     wins: dict[str, dict] = {}
     for ln in cp.stdout.splitlines():
         p = ln.split("\t")
-        if len(p) != 11:
+        if len(p) != 12:
             continue
-        sess, widx, pane, cmd, pid, cwd, name, left, top, w, h = p
+        sess, widx, pane, cmd, pid, cwd, name, left, top, w, h, wname = p
         key = f"{sess}:{widx}"
-        wins.setdefault(key, {"window": key, "ghostty": sess.startswith("w") and sess[1:].isdigit(),
+        wins.setdefault(key, {"window": key, "name": wname.strip() or None,
+                              "ghostty": sess.startswith("w") and sess[1:].isdigit(),
                               "panes": []})
         agent = _AGENT_CMDS.get(cmd.lower())
         if agent:
@@ -107,6 +134,15 @@ def windows() -> dict:
             state = cmd
         wins[key]["panes"].append({"pane": pane, "name": name.strip() or None, "command": cmd,
                                    "cwd": cwd, "state": state, "_xy": (int(top), int(left))})
+    taken = {w["name"] for w in wins.values() if w["name"]}
+    for rname, rule in _window_rules().items():
+        if rname in taken:
+            continue
+        for key, win in sorted(wins.items(), key=lambda kv: kv[0] != _focused_window()):
+            if not win["name"] and win["ghostty"] and len(win["panes"]) == rule.get("pane_count"):
+                name_window(key, rname)
+                win["name"] = rname
+                break
     focused = _focused_window()
     out = []
     for key, win in wins.items():
@@ -128,12 +164,17 @@ def windows() -> dict:
 
 
 def _pick_window(sel: str, wins: list) -> Optional[dict]:
-    """'w33627' / 'w33627:1' / '8' or '8-pane' (pane count) / 'focused' / '' (any)."""
+    """'Master Agent Window' (a window name, fuzzy) / 'w33627' / 'w33627:1' /
+    '8' or '8-pane' (pane count) / 'focused' / '' (any)."""
     s = sel.strip().lower().removesuffix("-pane").removesuffix(" pane").removesuffix("pane").strip()
     if not s:
         return None
     if s in ("focused", "this", "current"):
         return next((w for w in wins if w["focused"]), None)
+    named = {w["name"]: w for w in wins if w["name"]}
+    key = dispatch._match_key(sel.strip(), named) if named else None
+    if key is not None:
+        return named[key]
     if s.isdigit():
         hits = [w for w in wins if w["pane_count"] == int(s)]
         return hits[0] if len(hits) == 1 else (hits[0] if hits else None)
@@ -367,6 +408,15 @@ def main(argv: list[str]) -> int:
                 win = _pick_window(" ".join(rest), res["windows"])
                 res = {"ok": win is not None, "windows": [win] if win else [],
                        **({} if win else {"error": f"no window matches {' '.join(rest)!r}"})}
+        elif verb == "name-window":
+            if len(rest) < 2:
+                raise ValueError("usage: name-window <window> <name…>")
+            win = _pick_window(rest[0], windows()["windows"])
+            if win is None:
+                res = {"ok": False, "error": f"no window matches {rest[0]!r}"}
+            else:
+                name_window(win["window"], " ".join(rest[1:]))
+                res = {"ok": True, "window": win["window"], "name": " ".join(rest[1:])}
         elif verb == "start":
             if len(rest) < 3:
                 raise ValueError("usage: start <pane|empty|empty:<window>> <dir> <name…> [--codex]")
