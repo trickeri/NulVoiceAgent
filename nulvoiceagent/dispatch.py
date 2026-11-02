@@ -472,6 +472,9 @@ def _match_key(spoken: str, targets: dict) -> Optional[str]:
     clearly contains the other."""
     want = _norm(spoken)
     want = re.sub(r"^(?:the|this|that|my|a)\s+", "", want)  # drop a leading article
+    # Drop trailing hesitation fillers: "tell three D model Claude uh to …" made
+    # the target "three d model claude uh", which matched nothing (2026-11-01).
+    want = re.sub(r"(?:\s+(?:uh+|um+|er+|erm|hmm+|like))+$", "", want)
     if not want:
         return None
     wt = want.split()

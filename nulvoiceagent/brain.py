@@ -24,7 +24,7 @@ import subprocess
 import tempfile
 import time
 
-from . import config, dispatch, ledger
+from . import config, dispatch, history, ledger
 
 
 # --------------------------------------------------------------------------- #
@@ -654,7 +654,7 @@ def chat_act(text: str, names: list[str],
     (spoken_reply, action_name_or_None, (pane, message)_or_None)."""
     panes = list(dispatch.load().keys())
     prompt = (text + _command_skill_hint() + _action_hint(names)
-              + _ask_hint(panes) + _style_hint())
+              + _ask_hint(panes) + history.hint() + _style_hint())
     reply = _chat_dispatch(prompt, reset)
 
     action = None
@@ -666,7 +666,8 @@ def chat_act(text: str, names: list[str],
     ask = None
     a = _ASK_RE.search(reply)
     if a:
-        ask = (a.group(1).strip(), a.group(2).strip())
+        # "#<id>" = forward an earlier utterance verbatim from history.
+        ask = (a.group(1).strip(), history.resolve_ref(a.group(2).strip()))
         reply = _ASK_RE.sub("", reply).strip()
 
     return reply, action, ask

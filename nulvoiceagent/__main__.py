@@ -35,7 +35,7 @@ import signal
 import sys
 import time
 
-from . import (actions, askanswer, brain, config, dispatch, distill, done, ledger,
+from . import (actions, askanswer, brain, config, dispatch, distill, done, history, ledger,
                intents, narrate, passive, state, stt, tts, viewertts)
 
 _LOG = config.CACHE_DIR / "nulvoiceagent.log"
@@ -225,6 +225,9 @@ def _route_toggle() -> None:
         _clear_turn()
 
 
+_HISTORY_KINDS = {"you", "agent", "route", "ask", "intent", "answer", "action"}
+
+
 def _log(line: str) -> None:
     """Echo to stderr AND append to the log, so hotkey-triggered runs (whose
     stderr is invisible) are observable: `tail -f ~/.cache/nulvoiceagent/nulvoiceagent.log`."""
@@ -234,6 +237,12 @@ def _log(line: str) -> None:
             f.write(f"{time.strftime('%H:%M:%S')}  {line}\n")
     except OSError:
         pass
+    # Mirror conversational turns into the short-term history the chat brain sees
+    # (nulvoiceagent.history), so "forward that message" works even when the
+    # earlier turn was handled by the router and never reached the brain.
+    kind, sep, rest = line.partition(": ")
+    if sep and kind in _HISTORY_KINDS:
+        history.record(kind, rest)
 
 
 def _handle_chat(text: str, reset: bool = False) -> None:
